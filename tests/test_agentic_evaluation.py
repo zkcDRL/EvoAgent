@@ -96,7 +96,7 @@ class AgenticEvaluationTests(unittest.TestCase):
         }
         parsed = parse_unified_diff(DIFF)
         for arm, calls in expected_calls.items():
-            reviewer = ProductArmReviewer(arm, FakeClient(), 4096, 40)
+            reviewer = ProductArmReviewer(arm, FakeClient(), 12000, 40)
             findings = reviewer.review(DIFF, parsed)
             self.assertEqual(["SEC-PATH-TRAVERSAL"], [item.rule_id for item in findings])
             actual = {}
@@ -123,7 +123,7 @@ class AgenticEvaluationTests(unittest.TestCase):
             })
         suite = FairAblationSuite(
             product_reviewer_factories(FakeClient(), 40),
-            "fake-model", 4096, require_production_ready=False,
+            "fake-model", 12000, require_production_ready=False,
             bootstrap_iterations=200,
         )
         report = suite.run(cases)

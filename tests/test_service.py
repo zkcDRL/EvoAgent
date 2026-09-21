@@ -15,6 +15,7 @@ class ServiceTests(unittest.TestCase):
             host="127.0.0.1", port=8080, db_path=self.path, max_diff_bytes=10000,
             max_steps=8, timeout_seconds=10, llm_base_url="", llm_api_key="", llm_model="",
             github_webhook_secret="", github_token="", auto_post_review=False,
+            agent_token_budget=32768,
         )
 
     def tearDown(self):

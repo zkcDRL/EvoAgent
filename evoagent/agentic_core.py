@@ -10,7 +10,7 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from .diff_parser import ParsedDiff
-from .context_manager import ContextManager
+from .context_manager import ContextManager, estimate_tokens
 from .gates import FindingGate
 from .finding_identity import canonical_identity
 from .llm import JsonChatClient
@@ -92,6 +92,8 @@ ROLE_PERMISSIONS = {
     },
 }
 
+MIN_MODEL_OUTPUT_TOKENS = 128
+
 
 def _collect_evidence(observations: List[dict]) -> Dict[str, dict]:
     values = {}
@@ -132,27 +134,20 @@ class BoundedRole:
     ) -> Dict[str, Any]:
         started = time.monotonic()
         observations: List[dict] = []
-        starting_tokens = sum(
-            item.input_tokens + item.output_tokens
-            for item in ledger.model_calls if item.role == self.name
-        )
+        usage_scope = ledger.model_usage_scope()
         ledger.trace(
             self.name, "started", token_budget=self.token_budget,
             time_budget_seconds=self.time_budget, tools=tools.names(),
         )
         for step in range(1, self.max_steps + 1):
             elapsed = time.monotonic() - started
-            used = sum(
-                item.input_tokens + item.output_tokens
-                for item in ledger.model_calls if item.role == self.name
-            ) - starting_tokens
+            used = usage_scope.total_tokens()
             if elapsed >= self.time_budget or used >= self.token_budget:
                 ledger.trace(self.name, "budget_exhausted", step=step, tokens_used=used)
                 raise RuntimeBudgetExceeded("%s budget exhausted" % self.name)
-            output_allowance = self.context_manager.output_token_limit(
-                self.prompt, min(
-                    self.max_output_tokens, max(256, self.token_budget - used)
-                )
+            remaining_tokens = self.token_budget - used
+            provisional_output_allowance = self.context_manager.output_token_limit(
+                self.prompt, min(self.max_output_tokens, remaining_tokens)
             )
             current_context = user_context
             if self.working_memory_supplier is not None:
@@ -168,22 +163,48 @@ class BoundedRole:
                     )
             managed, context_stats = self.context_manager.build_managed_context(
                 current_context, tools.catalog(), observations,
-                max(0, self.token_budget - used),
+                remaining_tokens,
                 max(0, int(self.time_budget - elapsed)),
-                system_prompt=self.prompt, max_output_tokens=output_allowance,
+                system_prompt=self.prompt,
+                max_output_tokens=provisional_output_allowance,
+            )
+            managed_json = json.dumps(managed, ensure_ascii=False, default=str)
+            estimated_input_tokens = estimate_tokens({
+                "messages": [
+                    {"role": "system", "content": self.prompt},
+                    {"role": "user", "content": managed_json},
+                ],
+            })
+            available_output_tokens = remaining_tokens - estimated_input_tokens
+            if available_output_tokens < MIN_MODEL_OUTPUT_TOKENS:
+                ledger.trace(
+                    self.name, "budget_exhausted", step=step, tokens_used=used,
+                    estimated_input_tokens=estimated_input_tokens,
+                    minimum_output_tokens=MIN_MODEL_OUTPUT_TOKENS,
+                )
+                raise RuntimeBudgetExceeded("%s budget exhausted" % self.name)
+            output_allowance = self.context_manager.output_token_limit(
+                self.prompt,
+                min(self.max_output_tokens, available_output_tokens),
             )
             ledger.trace(
                 self.name, "context_prepared", step=step,
-                estimated_input_tokens=context_stats["estimated_input_tokens_after"],
+                estimated_input_tokens=estimated_input_tokens,
                 input_token_limit=context_stats["input_token_limit"],
                 observations_summarized=context_stats["observations"]["summarized"],
                 observations_dropped=context_stats["observations"]["dropped"],
             )
             action = self.client.complete_json(
-                self.name, self.prompt,
-                json.dumps(managed, ensure_ascii=False, default=str),
-                ledger, max_tokens=output_allowance,
+                self.name, self.prompt, managed_json,
+                usage_scope, max_tokens=output_allowance,
             )
+            actual_used = usage_scope.total_tokens()
+            if actual_used > self.token_budget:
+                ledger.trace(
+                    self.name, "budget_exhausted", step=step,
+                    tokens_used=actual_used,
+                )
+                raise RuntimeBudgetExceeded("%s budget exhausted" % self.name)
             kind = str(action.get("action", "")).strip().lower()
             ledger.trace(
                 self.name, "autonomous_decision", step=step, action=kind,

@@ -53,7 +53,7 @@ class ExecutionLedger:
     def record_model(
         self, role: str, provider: str, model: str, usage: Dict[str, Any],
         duration_ms: int, ok: bool = True, error: str = "",
-    ) -> None:
+    ) -> ModelCall:
         input_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
         output_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
         reported_cost = usage.get("cost")
@@ -67,6 +67,11 @@ class ExecutionLedger:
         )
         with self._lock:
             self.model_calls.append(call)
+        return call
+
+    def model_usage_scope(self) -> "ModelUsageScope":
+        """Return an isolated usage view that still records in this ledger."""
+        return ModelUsageScope(self)
 
     def record_tool(
         self, role: str, tool: str, arguments: Dict[str, Any], ok: bool,
@@ -132,3 +137,30 @@ class ExecutionLedger:
             "tool_call_log": tools,
             "agent_traces": traces if include_trace else {},
         }
+
+
+class ModelUsageScope:
+    """Track one role-loop invocation without mixing concurrent role names."""
+
+    def __init__(self, ledger: ExecutionLedger):
+        self._ledger = ledger
+        self._model_calls: List[ModelCall] = []
+        self._lock = threading.Lock()
+
+    def record_model(
+        self, role: str, provider: str, model: str, usage: Dict[str, Any],
+        duration_ms: int, ok: bool = True, error: str = "",
+    ) -> ModelCall:
+        call = self._ledger.record_model(
+            role, provider, model, usage, duration_ms, ok, error,
+        )
+        with self._lock:
+            self._model_calls.append(call)
+        return call
+
+    def total_tokens(self) -> int:
+        with self._lock:
+            return sum(
+                item.input_tokens + item.output_tokens
+                for item in self._model_calls
+            )

@@ -158,7 +158,7 @@ class EvaluationExperimentTests(unittest.TestCase):
             labelled_case("holdout", "holdout"),
         ]
         report = FairAblationSuite(
-            factories, "fake-model", 4096,
+            factories, "fake-model", 12000,
             require_production_ready=False, bootstrap_iterations=200,
         ).run(cases)
         self.assertEqual(5, len(report["arms"]))

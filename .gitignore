@@ -3,4 +3,5 @@ __pycache__/
 *.db
 .env
 .pytest_cache/
+EvoAgent(3).zip/
 
