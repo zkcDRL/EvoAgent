@@ -194,6 +194,9 @@ class AgentRuntime:
                         output = node.handler(state) or {}
                     if not isinstance(output, dict):
                         raise TypeError("runtime node %s must return a dict" % node.name)
+                    if cancel_check and cancel_check():
+                        emit("cancelled", node.name, attempt)
+                        raise RuntimeCancelled("Task was cancelled")
                     state.update(output)
                     if checkpoint_store is not None and task_id and node.checkpoint:
                         checkpoint_store.save_checkpoint(
