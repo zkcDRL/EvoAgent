@@ -115,6 +115,7 @@ class ReviewHarness:
         self, task_id: str, repository: str, pull_request: Optional[int], diff: str,
         tenant_id: str = "default",
     ) -> ReviewReport:
+        self.store.clear_cancel_request(task_id, tenant_id)
         return self.run(task_id, repository, pull_request, diff, tenant_id)
 
     def _planning(self, state: RuntimeState) -> Dict[str, Any]:

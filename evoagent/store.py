@@ -894,6 +894,19 @@ class TaskStore:
             cursor = conn.execute(query, params)
             return cursor.rowcount > 0
 
+    def clear_cancel_request(self, task_id: str, tenant_id: Optional[str] = None) -> bool:
+        query = (
+            "UPDATE tasks SET cancel_requested=0,updated_at=? "
+            "WHERE id=? AND cancel_requested=1"
+        )
+        params = [utc_now(), task_id]
+        if tenant_id is not None:
+            query += " AND tenant_id=?"
+            params.append(tenant_id)
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(query, params)
+            return cursor.rowcount > 0
+
     def is_cancelled(self, task_id: str) -> bool:
         with self._connect() as conn:
             row = conn.execute("SELECT cancel_requested FROM tasks WHERE id=?", (task_id,)).fetchone()

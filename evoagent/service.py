@@ -507,6 +507,7 @@ class ReviewService:
         diff = self.store.get_task_payload(task_id)
         if diff is None:
             raise ValueError("task payload is no longer available")
+        self.store.clear_cancel_request(task_id, tenant_id)
         self.queue.submit({
             "task_id": task_id, "repository": task["repository"],
             "pull_request": task.get("pull_request"),
