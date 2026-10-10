@@ -227,6 +227,9 @@ class PromptPolicyTests(unittest.TestCase):
             "Modify the finding for app.py.",
             "Edit the analysis based on production report.py.",
             "Rewrite the report for production analysis.py.",
+            "Generate a review report about app.py.",
+            "Update the review summary with evidence from app.py.",
+            "Write a finding describing the unsafe code in app.py.",
         ):
             for role in (None,) + KNOWN_ROLES:
                 rule_fields = (("lead_delegation_rules", "tool_selection_policy") if role is None
@@ -252,6 +255,7 @@ class PromptPolicyTests(unittest.TestCase):
         for text in (
             "Modify the report function in production app.py.",
             "Update report generation code in production app.py.",
+            "Update report generation with production code in app.py.",
         ):
             for role in (None,) + KNOWN_ROLES:
                 rule_fields = (("lead_delegation_rules", "tool_selection_policy") if role is None

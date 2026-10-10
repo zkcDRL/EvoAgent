@@ -48,9 +48,11 @@ def _requests_source_change(text: str) -> bool:
                 return True
             if token in _REVIEW_OBJECTS:
                 # A review noun may qualify source ("report generation code").
-                # Only an evidence link ends the direct object before a path.
+                # Evidence links end the object before paths or code descriptions.
                 review_object = True
-            elif review_object and token in ("for", "based"):
+            elif review_object and (
+                    token in ("for", "based", "about", "describing")
+                    or (token == "with" and re.match(r"\s+evidence\b", text[match.end():]))):
                 awaiting_object = False
     return False
 
