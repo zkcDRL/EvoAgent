@@ -118,7 +118,7 @@ class Settings:
     alert_smtp_host: str = ""
     alert_email_to: str = ""
     continuous_eval_seconds: int = 0
-    agent_token_budget: int = 8000
+    agent_token_budget: int = 32000
     agent_time_budget_seconds: int = 60
     agent_context_window_tokens: int = 32768
     agent_context_input_tokens: int = 20000

@@ -4,4 +4,5 @@ __pycache__/
 .env
 .pytest_cache/
 EvoAgent(3).zip/
-
+evaluation_data
+mainshi.md
