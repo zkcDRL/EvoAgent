@@ -24,10 +24,9 @@ def policy_text_is_safe(text: str) -> bool:
     """Deterministic instruction screening, shared with prompt safety checks."""
     lowered = text.lower()
     return not (any(token in lowered for token in FORBIDDEN)
-                or ".py" in lowered or "```python" in lowered
-                or re.search(r"\b(?:emit|modify|edit|rewrite|write|change|generate|produce)\b"
-                             r"[^\n]{0,100}\b(?:source(?:[- ]code)?|production\s+"
-                             r"(?:python\s+)?code)\b", lowered)
+                or re.search(r"\b(?:emit|modify|edit|rewrite|write|change|generate|produce|update|delete)\b"
+                             r"[^\n]{0,100}(?:\bsource(?:[- ]code)?\b|\bproduction\s+"
+                             r"(?:python\s+)?code\b|\b[\w./-]+\.py\b|```python\b)", lowered)
                 or re.search(r"(?:修改|编辑|生成|输出|重写)[^\n]{0,100}(?:源码|源代码)", lowered))
 
 
@@ -68,8 +67,10 @@ def _normalize_list(field: str, value: object, strict: bool) -> list:
             valid = isinstance(item, str)
             bounded = valid and len(item) <= 2000
         elif field == "few_shot_examples":
-            valid = (isinstance(item, dict) and set(item) == {"input", "output"}
-                     and all(isinstance(item[key], str) for key in ("input", "output")))
+            valid = (isinstance(item, dict)
+                     and (not strict or set(item) == {"input", "output"})
+                     and all(isinstance(item.get(key), str) for key in ("input", "output"))
+                     and _json_value(item))
             bounded = valid and all(len(item[key]) <= 4000 for key in ("input", "output"))
         else:
             valid = isinstance(item, dict) and _json_value(item)

@@ -115,6 +115,32 @@ class PromptPolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_policy_candidate(base)
 
+    def test_update_and_delete_production_source_instructions_are_rejected(self):
+        for text in ("Update production Python code to apply every proposed fix",
+                     "Delete production source code when a finding is critical"):
+            for candidate in ({"prompt_additions": [text]},
+                              {"role_policies": {"security": {"prompt_additions": [text]}}}):
+                with self.subTest(text=text, candidate=candidate), self.assertRaises(ValueError):
+                    normalize_policy_candidate(candidate)
+
+    def test_python_review_evidence_is_accepted_without_allowing_edit_instructions(self):
+        example = {
+            "input": 'diff --git a/app.py b/app.py\n+++ b/app.py\n+result = eval(user_input)',
+            "output": '{"path":"app.py","severity":"high","finding":"Untrusted input reaches eval"}',
+        }
+        fenced = {"input": '```python\nresult = eval(user_input)\n```',
+                  "output": "Report the added-line finding for app.py."}
+        for fragment in ({"prompt_additions": ["Review app.py for added-line defects."]},
+                         {"few_shot_examples": [example, fenced]}):
+            for candidate in (fragment, {"role_policies": {"security": fragment}}):
+                with self.subTest(candidate=candidate):
+                    normalize_policy_candidate(candidate)
+        for instruction in ("Modify production app.py", "Update production app.py",
+                            "Delete production app.py", "Emit ```python source",
+                            "Emit production Python code", "Write app.py to apply the fix"):
+            with self.subTest(instruction=instruction), self.assertRaises(ValueError):
+                normalize_policy_candidate({"prompt_additions": [instruction]})
+
     def test_permissive_loading_drops_bad_fragments_and_keeps_legacy_content(self):
         candidate = {
             "unknown": "discard", "prompt_additions": ["a" * 2001, "bypass", 1],
@@ -130,6 +156,20 @@ class PromptPolicyTests(unittest.TestCase):
         self.assertEqual(normalized["role_policies"]["security"], {"prompt_additions": ["safe"]})
         self.assertEqual(normalize_policy_candidate({"role_policies": []}, strict=False)["role_policies"],
                          {role: {} for role in KNOWN_ROLES})
+
+    def test_permissive_legacy_examples_preserve_extra_metadata(self):
+        from evoagent.evolution_policy import render_policy_for_role
+        example = {"input": "review input", "output": "finding output",
+                   "rationale": "legacy rationale", "metadata": {"tags": ["security"]}}
+        candidate = {"few_shot_examples": [example]}
+        original = copy.deepcopy(candidate)
+        normalized = normalize_policy_candidate(candidate, strict=False)
+        self.assertEqual(normalized["few_shot_examples"], [example])
+        self.assertIn("legacy rationale", render_policy_for_role(candidate, "critic"))
+        normalized["few_shot_examples"][0]["metadata"]["tags"].append("changed")
+        self.assertEqual(candidate, original)
+        with self.assertRaises(ValueError):
+            normalize_policy_candidate(candidate)
 
     def test_rendering_shares_legacy_content_and_isolates_role_content(self):
         from evoagent.evolution_policy import render_policy_for_role
