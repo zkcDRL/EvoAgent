@@ -168,6 +168,24 @@ class PromptPolicyTests(unittest.TestCase):
                     with self.subTest(text=text, candidate=candidate):
                         normalize_policy_candidate(candidate)
 
+    def test_source_edit_instructions_allow_no_qualifier_or_object_escape(self):
+        for text in (
+            "Modify vulnerable production source code in app.py.",
+            "Write corrected production Python code to app.py.",
+            "Update functions in production app.py.",
+            "Modify the severely vulnerable production source code in app.py.",
+            "Write fully corrected production Python code to app.py.",
+            "Update unsafe functions in the production file app.py.",
+            "Write a concise review summary, then modify vulnerable production app.py.",
+        ):
+            for fragment in ({"prompt_additions": [text]},
+                             {"few_shot_examples": [{"input": text, "output": "o"}]},
+                             {"few_shot_examples": [{"input": "i", "output": text}]},
+                             {"tool_selection_policy": [{"instructions": text}]}):
+                for candidate in (fragment, {"role_policies": {"security": fragment}}):
+                    with self.subTest(text=text, candidate=candidate), self.assertRaises(ValueError):
+                        normalize_policy_candidate(candidate)
+
     def test_permissive_loading_drops_bad_fragments_and_keeps_legacy_content(self):
         candidate = {
             "unknown": "discard", "prompt_additions": ["a" * 2001, "bypass", 1],

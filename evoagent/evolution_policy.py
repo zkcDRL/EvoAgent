@@ -18,19 +18,26 @@ ROLE_FIELDS = {
     for role in KNOWN_ROLES
 }
 FORBIDDEN = ("ignore previous", "disable safety", "bypass", "直接执行生产")
+_SOURCE_TARGET = (r"(?:source(?:[- ]code)?\b|code\b|implementation\b|files?\b|"
+                  r"[\w./-]+\.py\b|```python\b)")
+_SOURCE_EDIT = re.compile(
+    r"\b(?:modify|edit|rewrite|change|update|delete)\b"
+    r"\s+(?:[\w'-]+\s+)*?" + _SOURCE_TARGET)
+_SOURCE_OUTPUT = re.compile(
+    r"\b(?:emit|write|generate|produce)\b\s+(?:[\w'-]+\s+)*?"
+    r"(?:(?:review\s+)?(?:summary|report|findings?|analysis)\b|"
+    r"(?P<source>" + _SOURCE_TARGET + r"))")
 
 
 def policy_text_is_safe(text: str) -> bool:
     """Deterministic instruction screening, shared with prompt safety checks."""
     lowered = text.lower()
     return not (any(token in lowered for token in FORBIDDEN)
-                # Match the requested object, rather than a later evidence path
-                # or fence following an instruction to produce review output.
-                or re.search(r"\b(?:emit|modify|edit|rewrite|write|change|generate|produce|update|delete)\b"
-                             r"\s+(?:(?:the|a|an|following|new|updated|existing|complete)\s+)*"
-                             r"(?:(?:production|python)\s+)*"
-                             r"(?:source(?:[- ]code)?\b|code\b|implementation\b|files?\b|"
-                             r"[\w./-]+\.py\b|```python\b)", lowered)
+                # Allow intervening adjectives/objects without crossing punctuation.
+                or _SOURCE_EDIT.search(lowered)
+                # For output verbs, the first review artifact or source target
+                # determines the object. Later evidence is not that object.
+                or any(match.group("source") for match in _SOURCE_OUTPUT.finditer(lowered))
                 or re.search(r"(?:修改|编辑|生成|输出|重写)[^\n]{0,100}(?:源码|源代码)", lowered))
 
 
