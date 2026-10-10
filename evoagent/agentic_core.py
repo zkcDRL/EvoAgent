@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 
 from .diff_parser import ParsedDiff
 from .context_manager import ContextManager, estimate_tokens
+from .evolution_policy import normalize_policy_candidate, policy_budget, render_policy_for_role
 from .gates import FindingGate
 from .finding_identity import canonical_identity
 from .llm import JsonChatClient
@@ -313,27 +314,43 @@ class AgenticReviewer(Reviewer):
         self.scanner_provider = scanner_provider
         self.review_test_command = review_test_command
         self.prompt_overlay = str(prompt_overlay or "").strip()
-        self.structured_config = dict(structured_config or {})
+        self.structured_config = normalize_policy_candidate(structured_config, strict=False)
         self.memory_manager = memory_manager
         self.context_manager = context_manager or ContextManager()
         self.skill_provider = skill_provider
-        if self.structured_config:
-            self.prompt_overlay += "\nStructured runtime policy:\n" + json.dumps(
-                self.structured_config, ensure_ascii=False, sort_keys=True
-            )
         self.gate = FindingGate()
         self._summaries: Dict[str, dict] = {}
         self._memory_scopes: Dict[str, tuple] = {}
         self._memory_scope_lock = threading.Lock()
 
     def _token_budget(self, role: str) -> int:
-        raw = (self.structured_config.get("budget_parameters") or {}).get(
-            role, self.default_token_budget
+        return policy_budget(self.structured_config, role, self.default_token_budget)
+
+    def _role_prompt(self, role: str, selected_skills: Iterable[object] = ()) -> str:
+        prompt = {
+            "lead": LEAD_PROMPT,
+            "security": SECURITY_PROMPT,
+            "correctness-reliability": (
+                RELIABILITY_PROMPT + "\n" + SECURITY_PROMPT.split("Final action:", 1)[-1]
+            ),
+            "critic": CRITIC_PROMPT,
+        }[role]
+        if self.prompt_overlay:
+            prompt += "\nActive validated prompt overlay:\n" + self.prompt_overlay
+        policy = render_policy_for_role(
+            self.structured_config, role, global_prompt=self.prompt_overlay,
         )
-        try:
-            return max(256, min(int(raw), self.default_token_budget * 4))
-        except (TypeError, ValueError):
-            return self.default_token_budget
+        if policy:
+            prompt += "\n\n" + policy
+        if role in ("security", "correctness-reliability"):
+            instructions = "\n\n".join(
+                "<agent-skill name=\"%s\">\n%s\n</agent-skill>" % (
+                    skill.name, skill.instructions,
+                ) for skill in selected_skills
+            )
+            if instructions:
+                prompt += "\n\nActive Agent Skills:\n" + instructions
+        return prompt
 
     def review(self, diff: str, parsed: ParsedDiff) -> List[Finding]:
         raise RuntimeError(
@@ -842,10 +859,8 @@ class AgenticReviewer(Reviewer):
     ):
         working_memory_supplier, observation_sink = self._memory_hooks(context_key, "lead")
         role = BoundedRole(
-            "lead", LEAD_PROMPT + (
-                ("\nActive validated prompt overlay:\n" + self.prompt_overlay)
-                if self.prompt_overlay else ""
-            ), self.client, self._token_budget("lead"), self.default_time_budget,
+            "lead", self._role_prompt("lead"),
+            self.client, self._token_budget("lead"), self.default_time_budget,
             max_steps=max_steps,
             context_manager=self.context_manager,
             working_memory_supplier=working_memory_supplier,
@@ -886,10 +901,8 @@ class AgenticReviewer(Reviewer):
         ]
         working_memory_supplier, observation_sink = self._memory_hooks(context_key, "critic")
         role = BoundedRole(
-            "critic", CRITIC_PROMPT + (
-                ("\nActive validated prompt overlay:\n" + self.prompt_overlay)
-                if self.prompt_overlay else ""
-            ), self.client, self._token_budget("critic"), self.default_time_budget,
+            "critic", self._role_prompt("critic"),
+            self.client, self._token_budget("critic"), self.default_time_budget,
             max_steps=max_steps,
             context_manager=self.context_manager,
             working_memory_supplier=working_memory_supplier,
@@ -937,17 +950,7 @@ class AgenticReviewer(Reviewer):
                 for name in assignment.get("skills") or []
                 if name in (available_skills or {})
             ]
-            prompt = SECURITY_PROMPT if worker == "security" else (
-                RELIABILITY_PROMPT + "\n" + SECURITY_PROMPT.split("Final action:", 1)[-1]
-            )
-            if self.prompt_overlay:
-                prompt += "\nActive validated prompt overlay:\n" + self.prompt_overlay
-            if selected_skills:
-                prompt += "\n\nActive Agent Skills:\n" + "\n\n".join(
-                    "<agent-skill name=\"%s\">\n%s\n</agent-skill>" % (
-                        skill.name, skill.instructions,
-                    ) for skill in selected_skills
-                )
+            prompt = self._role_prompt(worker, selected_skills)
             working_memory_supplier, observation_sink = self._memory_hooks(task_id, worker)
             role = BoundedRole(
                 worker, prompt, self.client,

@@ -1,12 +1,20 @@
 import copy
 import hashlib
 import json
+import os
+import tempfile
 import unittest
 
+from evoagent.agentic_core import (
+    AgenticReviewer, CRITIC_PROMPT, LEAD_PROMPT, RELIABILITY_PROMPT, SECURITY_PROMPT,
+)
+from evoagent.diff_parser import parse_unified_diff
 from evoagent.evolution_policy import (
     KNOWN_ROLES, canonical_policy_json, normalize_policy_candidate,
     policy_budget, policy_sha256,
 )
+from evoagent.skills import AgentSkill
+from evoagent.store import TaskStore
 
 
 class PromptPolicyTests(unittest.TestCase):
@@ -323,6 +331,152 @@ class PromptPolicyTests(unittest.TestCase):
             self.assertEqual(policy_budget(candidate, "security", 1000), 1000)
         self.assertEqual(policy_budget({"budget_parameters": {"lead": 2000}}, "critic", 1000), 1000)
         self.assertEqual(policy_budget({"budget_parameters": {"unknown": 2000}}, "unknown", 1000), 1000)
+
+
+class RuntimePromptRoutingTests(unittest.TestCase):
+    def policy(self):
+        return {
+            "prompt_additions": ["SHARED_RUNTIME_MARKER", "GLOBAL_RUNTIME_MARKER"],
+            "few_shot_examples": [{"input": "SHARED_RUNTIME_EXAMPLE", "output": "ok"}],
+            "lead_delegation_rules": [{"when": "LEGACY_RUNTIME_DELEGATION"}],
+            "tool_selection_policy": [{"when": "LEGACY_RUNTIME_TOOL"}],
+            "budget_parameters": {"security": 654321},
+            "role_policies": {
+                role: {
+                    "prompt_additions": [role + "_RUNTIME_MARKER"],
+                    "few_shot_examples": [{"input": role + "_RUNTIME_EXAMPLE", "output": "ok"}],
+                    "delegation_rules" if role == "lead" else "tool_selection_policy":
+                        [{"when": role + "_RUNTIME_POLICY"}],
+                } for role in KNOWN_ROLES
+            },
+        }
+
+    def skill(self, name, instructions):
+        return AgentSkill(name, "Review the assigned change.", instructions, instructions)
+
+    def assert_policy_routed(self, prompt, role):
+        fixed = {
+            "lead": LEAD_PROMPT, "security": SECURITY_PROMPT,
+            "correctness-reliability": RELIABILITY_PROMPT, "critic": CRITIC_PROMPT,
+        }
+        self.assertTrue(prompt.startswith(fixed[role]))
+        for marker in ("GLOBAL_RUNTIME_MARKER", "SHARED_RUNTIME_MARKER",
+                       "SHARED_RUNTIME_EXAMPLE", "LEGACY_RUNTIME_TOOL",
+                       role + "_RUNTIME_MARKER", role + "_RUNTIME_EXAMPLE",
+                       role + "_RUNTIME_POLICY"):
+            self.assertIn(marker, prompt)
+        self.assertEqual(prompt.count("GLOBAL_RUNTIME_MARKER"), 1)
+        self.assertEqual("LEGACY_RUNTIME_DELEGATION" in prompt, role == "lead")
+        for other in KNOWN_ROLES:
+            if other != role:
+                for suffix in ("_RUNTIME_MARKER", "_RUNTIME_EXAMPLE", "_RUNTIME_POLICY"):
+                    self.assertNotIn(other + suffix, prompt)
+        for forbidden in ("budget_parameters", "654321"):
+            self.assertNotIn(forbidden, prompt)
+
+    def test_role_prompt_isolates_policy_and_appends_only_worker_skills(self):
+        candidate = self.policy()
+        original = copy.deepcopy(candidate)
+        reviewer = AgenticReviewer(None, None, prompt_overlay="GLOBAL_RUNTIME_MARKER",
+                                   structured_config=candidate)
+        selected = self.skill("selected-skill", "SELECTED_WORKER_SKILL_MARKER")
+        self.assertTrue(callable(getattr(reviewer, "_role_prompt", None)),
+                        "Runtime needs a centralized role prompt builder")
+        for role in KNOWN_ROLES:
+            with self.subTest(role=role):
+                prompt = reviewer._role_prompt(role, iter([selected]))
+                self.assert_policy_routed(prompt, role)
+                is_worker = role in ("security", "correctness-reliability")
+                self.assertEqual("SELECTED_WORKER_SKILL_MARKER" in prompt, is_worker)
+                if is_worker:
+                    self.assertLess(prompt.index(role + "_RUNTIME_POLICY"),
+                                    prompt.index("SELECTED_WORKER_SKILL_MARKER"))
+                if role == "correctness-reliability":
+                    self.assertIn(SECURITY_PROMPT.split("Final action:", 1)[-1], prompt)
+        self.assertEqual(candidate, original)
+        self.assertEqual(reviewer.prompt_overlay, "GLOBAL_RUNTIME_MARKER")
+
+    def test_runtime_budget_clamps_valid_integers_and_defaults_malformed_legacy_values(self):
+        for value, expected in ((2000, 2000), (1, 256), (-1, 256), (0, 256),
+                                (9999, 4000), ("2000", 1000), (True, 1000),
+                                (1.5, 1000), (None, 1000)):
+            with self.subTest(value=value):
+                reviewer = AgenticReviewer(None, None, default_token_budget=1000,
+                                           structured_config={"budget_parameters": {"security": value}})
+                self.assertEqual(reviewer._token_budget("security"), expected)
+                self.assertEqual(reviewer._token_budget("critic"), 1000)
+        for budgets in ([], [1000], "bad", 123, None):
+            with self.subTest(budgets=budgets):
+                reviewer = AgenticReviewer(None, None, default_token_budget=1000,
+                                           structured_config={"budget_parameters": budgets})
+                self.assertEqual(reviewer._token_budget("security"), 1000)
+
+    def test_review_routes_prompts_and_selected_skills_through_all_runtime_phases(self):
+        class PromptCaptureClient:
+            provider = "fake"
+            model = "prompt-capture"
+
+            def __init__(self):
+                self.calls = []
+
+            def complete_json(self, role, system, user, ledger=None, max_tokens=None):
+                task = json.loads(json.loads(user)["task"])
+                self.calls.append((role, system, task))
+                if ledger:
+                    ledger.record_model(role, self.provider, self.model,
+                                        {"prompt_tokens": 10, "completion_tokens": 5}, 1)
+                if role == "lead":
+                    if task["phase"] == "delegate":
+                        return {"action": "final", "risk_level": "high", "delegations": [
+                            {"assignment_id": "security-1", "worker": "security",
+                             "objective": "Review security", "skills": ["security-skill"]},
+                            {"assignment_id": "reliability-1", "worker": "correctness-reliability",
+                             "objective": "Review reliability", "skills": ["reliability-skill"]},
+                        ]}
+                    if task["phase"] == "assess-workers":
+                        return {"action": "final", "revision_requests": [
+                            {"assignment_id": "security-1", "worker": "security",
+                             "guidance": "Verify the changed-line evidence", "required_evidence": []},
+                        ], "critic_objective": "Challenge the worker findings"}
+                    if task["phase"] == "finalize":
+                        return {"action": "final", "accepted_finding_indices": [],
+                                "confidence_adjustments": [], "resolution_summary": "No defects"}
+                if role in ("security", "correctness-reliability"):
+                    return {"action": "final", "findings": []}
+                if role == "critic":
+                    return {"action": "final", "decisions": []}
+                raise AssertionError((role, task))
+
+        skills = [self.skill("security-skill", "SECURITY_SKILL_MARKER"),
+                  self.skill("reliability-skill", "RELIABILITY_SKILL_MARKER"),
+                  self.skill("unselected-skill", "UNSELECTED_SKILL_MARKER")]
+        diff = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+safe_call(data)\n"
+        with tempfile.TemporaryDirectory() as root:
+            store = TaskStore(os.path.join(root, "runtime.db"))
+            store.create("routing-task", "org/repo", 1, {"mode": "agentic"})
+            client = PromptCaptureClient()
+            reviewer = AgenticReviewer(store, client, prompt_overlay="GLOBAL_RUNTIME_MARKER",
+                                       structured_config=self.policy(), skill_provider=lambda _tenant: skills)
+            self.assertEqual(reviewer.review_with_context(
+                "routing-task", diff, parse_unified_diff(diff), "org/repo"), [])
+            self.assertEqual(len(client.calls), 7)
+            self.assertEqual({role for role, _prompt, _task in client.calls}, set(KNOWN_ROLES))
+            self.assertEqual([task["phase"] for role, _prompt, task in client.calls if role == "lead"],
+                             ["delegate", "assess-workers", "finalize"])
+            for role, prompt, task in client.calls:
+                with self.subTest(role=role, phase=task.get("phase", "worker")):
+                    self.assert_policy_routed(prompt, role)
+                    self.assertEqual("SECURITY_SKILL_MARKER" in prompt, role == "security")
+                    self.assertEqual("RELIABILITY_SKILL_MARKER" in prompt, role == "correctness-reliability")
+                    self.assertNotIn("UNSELECTED_SKILL_MARKER", prompt)
+                    if role in ("security", "correctness-reliability"):
+                        expected_name = "security-skill" if role == "security" else "reliability-skill"
+                        self.assertEqual(task["lead_assignment"]["skills"], [expected_name])
+                        self.assertEqual([item["name"] for item in task["active_agent_skills"]], [expected_name])
+                        self.assertEqual(task["changed_files"], ["app.py"])
+            security_feedback = [task["lead_feedback"] for role, _prompt, task in client.calls
+                                 if role == "security"]
+            self.assertEqual(security_feedback, ["", "Verify the changed-line evidence"])
 
 
 if __name__ == "__main__":
