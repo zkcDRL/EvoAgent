@@ -230,6 +230,12 @@ class PromptPolicyTests(unittest.TestCase):
             "Generate a review report about app.py.",
             "Update the review summary with evidence from app.py.",
             "Write a finding describing the unsafe code in app.py.",
+            "Write a review report on app.py.",
+            "Write a review report using evidence from app.py.",
+            "Write a review report using app.py as evidence.",
+            "Write a review report regarding app.py.",
+            "Write a review report concerning app.py.",
+            "Write a review report from app.py.",
         ):
             for role in (None,) + KNOWN_ROLES:
                 rule_fields = (("lead_delegation_rules", "tool_selection_policy") if role is None
@@ -256,6 +262,18 @@ class PromptPolicyTests(unittest.TestCase):
             "Modify the report function in production app.py.",
             "Update report generation code in production app.py.",
             "Update report generation with production code in app.py.",
+            "Modify the report function with evidence validation code in production app.py.",
+            "Modify the report function about app.py.",
+            "Modify the report function for app.py.",
+            "Update report generation based on app.py.",
+            "Modify the report function describing code in app.py.",
+            "Modify the report function on app.py.",
+            "Modify the report function using evidence from app.py.",
+            "Update report generation regarding app.py.",
+            "Update report generation concerning app.py.",
+            "Update report generation from app.py.",
+            "Write a review report with production code in app.py.",
+            "Write a review report on app.py, then modify production code.",
         ):
             for role in (None,) + KNOWN_ROLES:
                 rule_fields = (("lead_delegation_rules", "tool_selection_policy") if role is None
@@ -452,6 +470,45 @@ class RootCauseGeneratorTests(unittest.TestCase):
         self.assertEqual(generated["candidate"]["role_policies"], {role: {} for role in KNOWN_ROLES})
         self.assertEqual(generated["candidate"]["budget_parameters"], {})
 
+    def test_generator_distinguishes_review_evidence_from_source_compounds(self):
+        cases = (
+            ("Write a review report on app.py.", True),
+            ("Write a review report using evidence from app.py.", True),
+            ("Generate a review report about app.py.", True),
+            ("Update the review summary with evidence from app.py.", True),
+            ("Write a finding describing the unsafe code in app.py.", True),
+            ("Modify the report function with evidence validation code in production app.py.", False),
+            ("Modify the report function in production app.py.", False),
+            ("Update report generation code in production app.py.", False),
+            ("Update report generation with production code in app.py.", False),
+        )
+        for text, accepted in cases:
+            for role in (None,) + KNOWN_ROLES:
+                rule_fields = (("lead_delegation_rules", "tool_selection_policy") if role is None
+                               else ("delegation_rules",) if role == "lead"
+                               else ("tool_selection_policy",))
+                fragments = [
+                    {"prompt_additions": [text]},
+                    {"few_shot_examples": [{"input": text, "output": "o"}]},
+                    {"few_shot_examples": [{"input": "i", "output": text}]},
+                ] + [{field: [{"instructions": text}]} for field in rule_fields]
+                for fragment in fragments:
+                    candidate = fragment if role is None else {"role_policies": {role: fragment}}
+                    with self.subTest(text=text, role=role, fragment=fragment):
+                        generator = RootCauseEvolutionGenerator(self.JsonClient(candidate))
+                        if not accepted:
+                            with self.assertRaisesRegex(ValueError, "unsafe"):
+                                generator.generate([], "Review the diff.")
+                            continue
+                        try:
+                            generated = generator.generate([], "Review the diff.")
+                        except ValueError as exc:
+                            self.fail(f"Review evidence generation was rejected: {exc}")
+                        actual = (generated["candidate"] if role is None
+                                  else generated["candidate"]["role_policies"][role])
+                        for field, value in fragment.items():
+                            self.assertEqual(actual[field], value)
+
     def test_invalid_generated_candidates_raise_before_version_creation(self):
         invalid = [
             (None, "candidate must be an object"),
@@ -467,6 +524,7 @@ class RootCauseGeneratorTests(unittest.TestCase):
             ({"prompt_additions": ["Rewrite production source code."]}, "unsafe"),
             ({"prompt_additions": ["Modify the report function in production app.py."]}, "unsafe"),
             ({"prompt_additions": ["Update report generation code in production app.py."]}, "unsafe"),
+            ({"prompt_additions": ["Modify the report function with evidence validation code in production app.py."]}, "unsafe"),
             ({"role_policies": {"security": {"few_shot_examples": [
                 {"input": "diff", "output": "Modify production app.py."}]}}}, "unsafe"),
             ({"role_policies": {"lead": {"delegation_rules": [

@@ -32,7 +32,7 @@ _INSTRUCTION_TOKENS = re.compile(
 
 
 def _requests_source_change(text: str) -> bool:
-    """Scan operation objects, ending review objects at evidence links."""
+    """Scan operation objects, ending complete review objects at evidence links."""
     awaiting_object = False
     review_object = False
     for match in _INSTRUCTION_TOKENS.finditer(text):
@@ -48,12 +48,16 @@ def _requests_source_change(text: str) -> bool:
                 return True
             if token in _REVIEW_OBJECTS:
                 # A review noun may qualify source ("report generation code").
-                # Evidence links end the object before paths or code descriptions.
                 review_object = True
             elif review_object and (
-                    token in ("for", "based", "about", "describing")
+                    token in ("for", "based", "about", "describing", "on", "using",
+                              "regarding", "concerning", "from")
                     or (token == "with" and re.match(r"\s+evidence\b", text[match.end():]))):
                 awaiting_object = False
+            else:
+                # A compound continuation ("report function") means the review
+                # noun was not the complete object. Later links cannot hide it.
+                review_object = False
     return False
 
 
