@@ -18,26 +18,41 @@ ROLE_FIELDS = {
     for role in KNOWN_ROLES
 }
 FORBIDDEN = ("ignore previous", "disable safety", "bypass", "直接执行生产")
-_SOURCE_TARGET = (r"(?:source(?:[- ]code)?\b|code\b|implementation\b|files?\b|"
-                  r"[\w./-]+\.py\b|```python\b)")
-_SOURCE_EDIT = re.compile(
-    r"\b(?:modify|edit|rewrite|change|update|delete)\b"
-    r"\s+(?:[\w'-]+\s+)*?" + _SOURCE_TARGET)
-_SOURCE_OUTPUT = re.compile(
-    r"\b(?:emit|write|generate|produce)\b\s+(?:[\w'-]+\s+)*?"
-    r"(?:(?:review\s+)?(?:summary|report|findings?|analysis)\b|"
-    r"(?P<source>" + _SOURCE_TARGET + r"))")
+_SOURCE_OPERATIONS = frozenset((
+    "modify", "edit", "rewrite", "change", "update", "delete",
+    "emit", "write", "generate", "produce",
+))
+_SOURCE_OBJECTS = frozenset(("source", "source-code", "code", "implementation", "file", "files"))
+_REVIEW_OBJECTS = frozenset(("summary", "report", "finding", "findings", "analysis"))
+# Consume paths before words so report.py cannot become the review noun report.
+# Quotes/backticks are formatting; other punctuation ends an object phrase.
+_INSTRUCTION_TOKENS = re.compile(
+    r"(?P<source>[\w./-]+\.py\b|```python\b)|"
+    r"(?P<word>\w+(?:[-']\w+)*)|(?P<boundary>[^\w\s`'\"])")
+
+
+def _requests_source_change(text: str) -> bool:
+    """Classify the first recognized object after each operation verb."""
+    awaiting_object = False
+    for match in _INSTRUCTION_TOKENS.finditer(text):
+        token = match.group()
+        if match.lastgroup == "boundary":
+            awaiting_object = False
+        elif token in _SOURCE_OPERATIONS:
+            awaiting_object = True
+        elif awaiting_object:
+            if match.lastgroup == "source" or token in _SOURCE_OBJECTS:
+                return True
+            if token in _REVIEW_OBJECTS:
+                awaiting_object = False
+    return False
 
 
 def policy_text_is_safe(text: str) -> bool:
     """Deterministic instruction screening, shared with prompt safety checks."""
     lowered = text.lower()
     return not (any(token in lowered for token in FORBIDDEN)
-                # Allow intervening adjectives/objects without crossing punctuation.
-                or _SOURCE_EDIT.search(lowered)
-                # For output verbs, the first review artifact or source target
-                # determines the object. Later evidence is not that object.
-                or any(match.group("source") for match in _SOURCE_OUTPUT.finditer(lowered))
+                or _requests_source_change(lowered)
                 or re.search(r"(?:修改|编辑|生成|输出|重写)[^\n]{0,100}(?:源码|源代码)", lowered))
 
 

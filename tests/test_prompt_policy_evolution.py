@@ -186,6 +186,58 @@ class PromptPolicyTests(unittest.TestCase):
                     with self.subTest(text=text, candidate=candidate), self.assertRaises(ValueError):
                         normalize_policy_candidate(candidate)
 
+    def test_review_named_python_files_are_source_targets(self):
+        for text in (
+            "Write production report.py.",
+            "Generate production analysis.py.",
+            "Write production summary.py.",
+            "Emit production findings.py.",
+            "Generate production review/report.py.",
+            "Write production `report.py`.",
+            "Generate production 'analysis.py'.",
+            'Write production "summary.py".',
+        ):
+            for role in (None,) + KNOWN_ROLES:
+                rule_fields = (("lead_delegation_rules", "tool_selection_policy") if role is None
+                               else ("delegation_rules",) if role == "lead"
+                               else ("tool_selection_policy",))
+                fragments = [
+                    {"prompt_additions": [text]},
+                    {"few_shot_examples": [{"input": text, "output": "o"}]},
+                    {"few_shot_examples": [{"input": "i", "output": text}]},
+                ] + [{field: [{"instructions": text}]} for field in rule_fields]
+                for fragment in fragments:
+                    candidate = fragment if role is None else {"role_policies": {role: fragment}}
+                    with self.subTest(text=text, role=role, fragment=fragment), self.assertRaises(ValueError):
+                        normalize_policy_candidate(candidate)
+
+    def test_review_artifact_edits_do_not_target_later_python_evidence(self):
+        for text in (
+            "Update the review summary based on app.py.",
+            "Modify the finding for app.py.",
+            "Edit the analysis based on production report.py.",
+            "Rewrite the report for production analysis.py.",
+        ):
+            for role in (None,) + KNOWN_ROLES:
+                rule_fields = (("lead_delegation_rules", "tool_selection_policy") if role is None
+                               else ("delegation_rules",) if role == "lead"
+                               else ("tool_selection_policy",))
+                fragments = [
+                    {"prompt_additions": [text]},
+                    {"few_shot_examples": [{"input": text, "output": "o"}]},
+                    {"few_shot_examples": [{"input": "i", "output": text}]},
+                ] + [{field: [{"instructions": text}]} for field in rule_fields]
+                for fragment in fragments:
+                    candidate = fragment if role is None else {"role_policies": {role: fragment}}
+                    with self.subTest(text=text, role=role, fragment=fragment):
+                        try:
+                            normalized = normalize_policy_candidate(candidate)
+                        except ValueError as exc:
+                            self.fail(f"Review artifact edit was rejected: {exc}")
+                        actual = normalized if role is None else normalized["role_policies"][role]
+                        for field, value in fragment.items():
+                            self.assertEqual(actual[field], value)
+
     def test_permissive_loading_drops_bad_fragments_and_keeps_legacy_content(self):
         candidate = {
             "unknown": "discard", "prompt_additions": ["a" * 2001, "bypass", 1],
