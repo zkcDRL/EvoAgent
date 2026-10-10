@@ -23,7 +23,15 @@ _SOURCE_OPERATIONS = frozenset((
     "emit", "write", "generate", "produce",
 ))
 _SOURCE_OBJECTS = frozenset(("source", "source-code", "code", "implementation", "file", "files"))
+_SOURCE_COMPOUNDS = frozenset((
+    "function", "functions", "method", "methods", "class", "classes",
+    "module", "modules", "generation",
+))
 _REVIEW_OBJECTS = frozenset(("summary", "report", "finding", "findings", "analysis"))
+_REVIEW_ADVERBS = frozenset((
+    "clearly", "specifically", "briefly", "concisely", "directly", "explicitly", "precisely",
+))
+_REVIEW_FORMATS = frozenset(("json", "yaml", "markdown", "html", "xml", "csv"))
 # Consume paths before words so report.py cannot become the review noun report.
 # Quotes/backticks are formatting; other punctuation ends an object phrase.
 _INSTRUCTION_TOKENS = re.compile(
@@ -32,32 +40,49 @@ _INSTRUCTION_TOKENS = re.compile(
 
 
 def _requests_source_change(text: str) -> bool:
-    """Scan operation objects, ending complete review objects at evidence links."""
+    """Keep source compounds distinct from review artifacts and their evidence."""
     awaiting_object = False
     review_object = False
-    for match in _INSTRUCTION_TOKENS.finditer(text):
+    source_compound = False
+    format_end = -1
+    tokens = list(_INSTRUCTION_TOKENS.finditer(text))
+    for index, match in enumerate(tokens):
         token = match.group()
         if match.lastgroup == "boundary":
             awaiting_object = False
             review_object = False
+            source_compound = False
         elif token in _SOURCE_OPERATIONS:
             awaiting_object = True
             review_object = False
+            source_compound = False
         elif awaiting_object:
             if match.lastgroup == "source" or token in _SOURCE_OBJECTS:
                 return True
+            if token in _SOURCE_COMPOUNDS:
+                source_compound = True
+            if source_compound:
+                # A later review noun may be a source object's name or modifier.
+                continue
             if token in _REVIEW_OBJECTS:
-                # A review noun may qualify source ("report generation code").
                 review_object = True
             elif review_object and (
                     token in ("for", "based", "about", "describing", "on", "using",
                               "regarding", "concerning", "from")
                     or (token == "with" and re.match(r"\s+evidence\b", text[match.end():]))):
                 awaiting_object = False
-            else:
-                # A compound continuation ("report function") means the review
-                # noun was not the complete object. Later links cannot hide it.
-                review_object = False
+            elif review_object:
+                if token in _REVIEW_ADVERBS or index <= format_end:
+                    continue
+                if (token in ("in", "as") and index + 1 < len(tokens)
+                        and tokens[index + 1].group() in _REVIEW_FORMATS):
+                    format_end = index + 1
+                    if index + 2 < len(tokens) and tokens[index + 2].group() == "format":
+                        format_end += 1
+                else:
+                    # Unrecognized continuations may form source compounds;
+                    # unlike output qualifiers, they cannot regain an exemption.
+                    source_compound = True
     return False
 
 

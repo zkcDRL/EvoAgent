@@ -236,6 +236,16 @@ class PromptPolicyTests(unittest.TestCase):
             "Write a review report regarding app.py.",
             "Write a review report concerning app.py.",
             "Write a review report from app.py.",
+            "Write the review report in JSON using evidence from app.py.",
+            "Generate a review report specifically about app.py.",
+            "Write a finding clearly describing the unsafe code in app.py.",
+            "Write the review report as JSON using evidence from app.py.",
+            "Write the review report in JSON format using evidence from app.py.",
+            "Write the review report clearly in JSON using evidence from app.py.",
+            "Write the review report in JSON clearly using evidence from app.py.",
+            "Write the JSON review report clearly using evidence from app.py.",
+            "Generate a review report specifically based on production report.py.",
+            "Write a finding briefly describing the unsafe code in app.py.",
         ):
             for role in (None,) + KNOWN_ROLES:
                 rule_fields = (("lead_delegation_rules", "tool_selection_policy") if role is None
@@ -274,6 +284,24 @@ class PromptPolicyTests(unittest.TestCase):
             "Update report generation from app.py.",
             "Write a review report with production code in app.py.",
             "Write a review report on app.py, then modify production code.",
+            "Modify the function named report with evidence validation code in production app.py.",
+            "Modify the function named report for app.py.",
+            "Modify the function named report based on app.py.",
+            "Modify the function named report about app.py.",
+            "Modify the function named report describing code in app.py.",
+            "Modify the function named report on app.py.",
+            "Modify the function named report using evidence from app.py.",
+            "Modify the function named report regarding app.py.",
+            "Modify the function named report concerning app.py.",
+            "Modify the function named report from app.py.",
+            "Modify the function named report in JSON using evidence from app.py.",
+            "Modify the function named report clearly describing code in app.py.",
+            "Update report generation named analysis using evidence from app.py.",
+            "Modify the vulnerable function called analysis specifically about app.py.",
+            "Modify the class named summary using evidence from production app.py.",
+            "Update the method named finding regarding production app.py.",
+            "Modify the module named report with evidence validation code in app.py.",
+            "Update report generation specifically about code in app.py.",
         ):
             for role in (None,) + KNOWN_ROLES:
                 rule_fields = (("lead_delegation_rules", "tool_selection_policy") if role is None
@@ -477,6 +505,10 @@ class RootCauseGeneratorTests(unittest.TestCase):
             ("Generate a review report about app.py.", True),
             ("Update the review summary with evidence from app.py.", True),
             ("Write a finding describing the unsafe code in app.py.", True),
+            ("Write the review report in JSON using evidence from app.py.", True),
+            ("Generate a review report specifically about app.py.", True),
+            ("Write a finding clearly describing the unsafe code in app.py.", True),
+            ("Modify the function named report with evidence validation code in production app.py.", False),
             ("Modify the report function with evidence validation code in production app.py.", False),
             ("Modify the report function in production app.py.", False),
             ("Update report generation code in production app.py.", False),
@@ -530,6 +562,7 @@ class RootCauseGeneratorTests(unittest.TestCase):
             ({"role_policies": {"lead": {"delegation_rules": [
                 {"instructions": "Modify production app.py."}]}}}, "unsafe"),
             ({"prompt_additions": ["a" * 2001]}, "oversized"),
+            ({"prompt_additions": ["Modify the function named report with evidence validation code in production app.py."]}, "unsafe"),
         ]
         with tempfile.TemporaryDirectory() as root:
             store = TaskStore(os.path.join(root, "generation.db"))
