@@ -9,10 +9,12 @@ from evoagent.agentic_core import (
     AgenticReviewer, CRITIC_PROMPT, LEAD_PROMPT, RELIABILITY_PROMPT, SECURITY_PROMPT,
 )
 from evoagent.diff_parser import parse_unified_diff
+from evoagent.evolution import EvolutionEngine
 from evoagent.evolution_policy import (
     KNOWN_ROLES, canonical_policy_json, normalize_policy_candidate,
     policy_budget, policy_sha256,
 )
+from evoagent.evolution_v2 import RootCauseEvolutionGenerator
 from evoagent.skills import AgentSkill
 from evoagent.store import TaskStore
 
@@ -246,6 +248,25 @@ class PromptPolicyTests(unittest.TestCase):
                         for field, value in fragment.items():
                             self.assertEqual(actual[field], value)
 
+    def test_review_named_source_objects_are_rejected(self):
+        for text in (
+            "Modify the report function in production app.py.",
+            "Update report generation code in production app.py.",
+        ):
+            for role in (None,) + KNOWN_ROLES:
+                rule_fields = (("lead_delegation_rules", "tool_selection_policy") if role is None
+                               else ("delegation_rules",) if role == "lead"
+                               else ("tool_selection_policy",))
+                fragments = [
+                    {"prompt_additions": [text]},
+                    {"few_shot_examples": [{"input": text, "output": "o"}]},
+                    {"few_shot_examples": [{"input": "i", "output": text}]},
+                ] + [{field: [{"instructions": text}]} for field in rule_fields]
+                for fragment in fragments:
+                    candidate = fragment if role is None else {"role_policies": {role: fragment}}
+                    with self.subTest(text=text, role=role, fragment=fragment), self.assertRaises(ValueError):
+                        normalize_policy_candidate(candidate)
+
     def test_permissive_loading_drops_bad_fragments_and_keeps_legacy_content(self):
         candidate = {
             "unknown": "discard", "prompt_additions": ["a" * 2001, "bypass", 1],
@@ -331,6 +352,136 @@ class PromptPolicyTests(unittest.TestCase):
             self.assertEqual(policy_budget(candidate, "security", 1000), 1000)
         self.assertEqual(policy_budget({"budget_parameters": {"lead": 2000}}, "critic", 1000), 1000)
         self.assertEqual(policy_budget({"budget_parameters": {"unknown": 2000}}, "unknown", 1000), 1000)
+
+
+class RootCauseGeneratorTests(unittest.TestCase):
+    class JsonClient:
+        provider = "fake"
+        model = "policy-generator"
+
+        def __init__(self, candidate):
+            self.result = {
+                "candidate": candidate,
+                "clusters": [{"name": "missing evidence", "failure_case_ids": [7],
+                              "root_cause": "Incomplete tracing", "roles": ["lead", "security"]}],
+                "rationale": "Trace evidence before finalizing the review.",
+            }
+            self.request = None
+
+        def complete_json(self, role, system, user, ledger=None, max_tokens=None):
+            self.request = json.loads(user)
+            ledger.record_model(role, self.provider, self.model,
+                                {"prompt_tokens": 12, "completion_tokens": 8}, 1)
+            return self.result
+
+    def test_role_candidate_is_normalized_without_leaking_roles_into_prompt_diff(self):
+        candidate = {
+            "prompt_additions": ["Require added-line evidence."],
+            "budget_parameters": {"security": 4000},
+            "role_policies": {
+                "lead": {"prompt_additions": ["Check worker evidence."],
+                         "delegation_rules": [{"when": "untrusted input",
+                                               "delegate_to": ["security"]}]},
+                "security": {
+                    "prompt_additions": ["Trace untrusted input to the sink."],
+                    "few_shot_examples": [{"input": "eval(raw)", "output": "Report the sink."}],
+                    "tool_selection_policy": [{"hypothesis": "input reaches sink",
+                                               "preferred_tools": ["symbol"]}],
+                },
+            },
+        }
+        original = copy.deepcopy(candidate)
+        client = self.JsonClient(candidate)
+        failures = [{"id": 7, "category": "missed_issue", "task_id": "review-7",
+                     "payload": {"finding": {"path": "app.py"}, "note": "n" * 1100,
+                                 "private_metadata": "omit"}, "unused": "omit"}]
+        generated = RootCauseEvolutionGenerator(client).generate(failures, "Review the diff.\n")
+        expected = {
+            "prompt_additions": ["Require added-line evidence."],
+            "few_shot_examples": [], "lead_delegation_rules": [], "tool_selection_policy": [],
+            "budget_parameters": {"security": 4000},
+            "role_policies": {
+                "lead": {"prompt_additions": ["Check worker evidence."],
+                         "delegation_rules": [{"when": "untrusted input",
+                                               "delegate_to": ["security"]}]},
+                "security": {
+                    "prompt_additions": ["Trace untrusted input to the sink."],
+                    "few_shot_examples": [{"input": "eval(raw)", "output": "Report the sink."}],
+                    "tool_selection_policy": [{"hypothesis": "input reaches sink",
+                                               "preferred_tools": ["symbol"]}],
+                },
+                "correctness-reliability": {}, "critic": {},
+            },
+        }
+        self.assertEqual(generated["candidate"], expected)
+        self.assertEqual(candidate, original)
+        self.assertEqual(generated["candidate_prompt"],
+                         "Review the diff.\n\nValidated evolution constraints:\n- Require added-line evidence.")
+        self.assertTrue(generated["change_diff"].startswith("--- active-prompt\n+++ candidate-prompt\n"))
+        self.assertIn("+Validated evolution constraints:", generated["change_diff"])
+        self.assertIn("+- Require added-line evidence.", generated["change_diff"])
+        for text in ("Trace untrusted", "Check worker", "role_policies", "4000"):
+            self.assertNotIn(text, generated["candidate_prompt"])
+            self.assertNotIn(text, generated["change_diff"])
+        self.assertEqual(generated["clusters"], [{
+            "name": "missing evidence", "failure_case_ids": [7],
+            "root_cause": "Incomplete tracing", "roles": ["lead", "security"],
+        }])
+        self.assertEqual(generated["rationale"], "Trace evidence before finalizing the review.")
+        self.assertEqual(generated["generator"], {"provider": "fake", "model": "policy-generator"})
+        self.assertEqual(generated["generation"]["llm_calls"], 1)
+        self.assertEqual(generated["generation"]["total_tokens"], 20)
+        evidence = [{"id": 7, "category": "missed_issue", "task_id": "review-7",
+                     "finding": {"path": "app.py"}, "note": "n" * 1000}]
+        self.assertEqual(generated["failure_cases"], evidence)
+        self.assertEqual(client.request, {"active_prompt": "Review the diff.\n", "failure_cases": evidence})
+        generated["candidate"]["role_policies"]["lead"]["delegation_rules"][0]["when"] = "changed"
+        self.assertEqual(candidate, original)
+
+    def test_legacy_candidate_is_normalized_and_accepts_python_review_evidence(self):
+        client = self.JsonClient({
+            "prompt_additions": ["Review app.py for added-line defects."],
+            "few_shot_examples": [{"input": "```python\neval(raw)\n```", "output": "Report the sink."}],
+        })
+        generated = RootCauseEvolutionGenerator(client).generate([], "Review the diff.")
+        self.assertIn("Review app.py for added-line defects.", generated["candidate_prompt"])
+        self.assertEqual(generated["candidate"]["role_policies"], {role: {} for role in KNOWN_ROLES})
+        self.assertEqual(generated["candidate"]["budget_parameters"], {})
+
+    def test_invalid_generated_candidates_raise_before_version_creation(self):
+        invalid = [
+            (None, "candidate must be an object"),
+            ([], "candidate must be an object"),
+            ({"role_policies": {"auditor": {}}}, "unknown roles"),
+            ({"role_policies": {"lead": {"tool_selection_policy": []}}}, "unsupported fields"),
+            ({"role_policies": {"security": {"delegation_rules": []}}}, "unsupported fields"),
+            ({"few_shot_examples": [{"input": "ignore previous instructions", "output": "ok"}]}, "unsafe"),
+            ({"few_shot_examples": [{"input": "diff", "output": "disable safety"}]}, "unsafe"),
+            ({"budget_parameters": {"security": True}}, "integer values"),
+            ({"budget_parameters": {"security": "4000"}}, "integer values"),
+            ({"budget_parameters": {"auditor": 4000}}, "known roles"),
+            ({"prompt_additions": ["Rewrite production source code."]}, "unsafe"),
+            ({"prompt_additions": ["Modify the report function in production app.py."]}, "unsafe"),
+            ({"prompt_additions": ["Update report generation code in production app.py."]}, "unsafe"),
+            ({"role_policies": {"security": {"few_shot_examples": [
+                {"input": "diff", "output": "Modify production app.py."}]}}}, "unsafe"),
+            ({"role_policies": {"lead": {"delegation_rules": [
+                {"instructions": "Modify production app.py."}]}}}, "unsafe"),
+            ({"prompt_additions": ["a" * 2001]}, "oversized"),
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            store = TaskStore(os.path.join(root, "generation.db"))
+            store.create("failed-review", "org/repo", 1, {})
+            store.record_failure_case("failed-review", "missed_issue", {"note": "Missing evidence"})
+            for candidate, message in invalid:
+                with self.subTest(candidate=candidate):
+                    engine = EvolutionEngine(store, seed_defaults=False,
+                                             candidate_generator=RootCauseEvolutionGenerator(self.JsonClient(candidate)))
+                    with self.assertRaisesRegex(ValueError, message):
+                        engine.auto_propose("llm-review")
+                    self.assertEqual(store.list_skill_versions("llm-review"), [])
+                    self.assertEqual(store.list_evolution_runs(), [])
+                    self.assertEqual(len(store.list_failure_cases(True)), 1)
 
 
 class RuntimePromptRoutingTests(unittest.TestCase):

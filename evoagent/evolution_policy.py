@@ -32,18 +32,25 @@ _INSTRUCTION_TOKENS = re.compile(
 
 
 def _requests_source_change(text: str) -> bool:
-    """Classify the first recognized object after each operation verb."""
+    """Scan operation objects, ending review objects at evidence links."""
     awaiting_object = False
+    review_object = False
     for match in _INSTRUCTION_TOKENS.finditer(text):
         token = match.group()
         if match.lastgroup == "boundary":
             awaiting_object = False
+            review_object = False
         elif token in _SOURCE_OPERATIONS:
             awaiting_object = True
+            review_object = False
         elif awaiting_object:
             if match.lastgroup == "source" or token in _SOURCE_OBJECTS:
                 return True
             if token in _REVIEW_OBJECTS:
+                # A review noun may qualify source ("report generation code").
+                # Only an evidence link ends the direct object before a path.
+                review_object = True
+            elif review_object and token in ("for", "based"):
                 awaiting_object = False
     return False
 
