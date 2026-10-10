@@ -24,9 +24,13 @@ def policy_text_is_safe(text: str) -> bool:
     """Deterministic instruction screening, shared with prompt safety checks."""
     lowered = text.lower()
     return not (any(token in lowered for token in FORBIDDEN)
+                # Match the requested object, rather than a later evidence path
+                # or fence following an instruction to produce review output.
                 or re.search(r"\b(?:emit|modify|edit|rewrite|write|change|generate|produce|update|delete)\b"
-                             r"[\s\S]{0,100}(?:\bsource(?:[- ]code)?\b|\bproduction\s+"
-                             r"(?:python\s+)?code\b|\b[\w./-]+\.py\b|```python\b)", lowered)
+                             r"\s+(?:(?:the|a|an|following|new|updated|existing|complete)\s+)*"
+                             r"(?:(?:production|python)\s+)*"
+                             r"(?:source(?:[- ]code)?\b|code\b|implementation\b|files?\b|"
+                             r"[\w./-]+\.py\b|```python\b)", lowered)
                 or re.search(r"(?:修改|编辑|生成|输出|重写)[^\n]{0,100}(?:源码|源代码)", lowered))
 
 

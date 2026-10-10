@@ -155,6 +155,19 @@ class PromptPolicyTests(unittest.TestCase):
                     with self.subTest(text=text, candidate=candidate), self.assertRaises(ValueError):
                         normalize_policy_candidate(candidate)
 
+    def test_multiline_review_output_requests_do_not_target_source_evidence(self):
+        for text in (
+            "Write a concise review summary.\nEvidence: app.py contains an unsafe eval call.",
+            "Generate a JSON finding for this evidence:\n```python\nresult = eval(user_input)\n```",
+        ):
+            for fragment in ({"prompt_additions": [text]},
+                             {"few_shot_examples": [{"input": text, "output": "o"}]},
+                             {"few_shot_examples": [{"input": "i", "output": text}]},
+                             {"tool_selection_policy": [{"instructions": text}]}):
+                for candidate in (fragment, {"role_policies": {"security": fragment}}):
+                    with self.subTest(text=text, candidate=candidate):
+                        normalize_policy_candidate(candidate)
+
     def test_permissive_loading_drops_bad_fragments_and_keeps_legacy_content(self):
         candidate = {
             "unknown": "discard", "prompt_additions": ["a" * 2001, "bypass", 1],
