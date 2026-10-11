@@ -52,6 +52,66 @@ OPERATION_SCOPE_CASES = (
 )
 
 
+DIRECTIVE_SCOPE_CASES = (
+    ("Delete the class `Summary` from production app.py.", False),
+    ("Delete the class 'Summary' from production app.py.", False),
+    ('Delete the class "Summary" from production app.py.', False),
+    ("Delete the class Summary from production app.py.", False),
+    ("Delete the class summary from production app.py.", False),
+    ("Modify the function `analysis` using evidence from app.py.", False),
+    ("Modify the function Analysis using evidence from app.py.", False),
+    ("Modify the function 'analysis' using evidence from app.py.", False),
+    ('Modify the function "analysis" using evidence from app.py.', False),
+    ("Update the method report() to generate a summary from app.py.", False),
+    ("Modify the class Analysis[T] to write a review report from app.py.", False),
+    ("DELETE THE CLASS\n`SUMMARY`\nFROM PRODUCTION APP.PY.", False),
+    ("Write a review report and generate a summary based on app.py.", True),
+    ("Generate a review report and write a summary based on app.py.", True),
+    ("Write a review report, generate a finding, and update a summary based on app.py.", True),
+    ("Write a function analysis and generate a class review report based on app.py.", True),
+    ("WRITE A REVIEW REPORT\nAND GENERATE A SUMMARY BASED ON APP.PY.", True),
+    ("WRITE A FUNCTION ANALYSIS BASED ON APP.PY.", True),
+    ("Write a review report; generate a summary based on app.py.", True),
+    ("Write a review report. Generate a summary based on app.py.", True),
+    ("Write a finding describing `delete()` in app.py.", True),
+    ("Write a finding describing 'delete()' in app.py.", True),
+    ('Write a finding describing "delete()" in app.py.', True),
+    ("Write a finding describing delete() in app.py.", True),
+    ("Write a finding describing client.delete(record) in app.py.", True),
+    ("Write a review report using the function named update() in app.py.", True),
+    ("Write a review report using the function named update in app.py.", True),
+    ("Write a review report using the function named `update` in app.py.", True),
+    ("Write a review report using the functions named delete() and update() in app.py.", True),
+    ("Write a review report using the functions named delete and update in app.py.", True),
+    ("Write a finding for delete () and update () in app.py.", True),
+    ("Write a finding using evidence: `delete` in app.py.", True),
+    ('Write a finding describing the string "delete production app.py" in app.py.', True),
+    ("Write a finding for this evidence:\n```python\ndelete(record)\nupdate(record)\n```", True),
+    ("WRITE A FINDING DESCRIBING\n`DELETE()`\nIN APP.PY.", True),
+    ("Write a review report and delete the class `Summary` from production app.py.", False),
+    ("Write a finding describing `delete()` in app.py, then update production app.py.", False),
+    ("Write a finding describing update() and delete production app.py.", False),
+    ("Write a review report to delete production app.py.", False),
+    ("Write a review report using app.py to delete production code.", False),
+    ("Write a review report using update() in app.py; delete the class `Summary` from app.py.", False),
+    ("Write a finding describing delete() in app.py. Update production code.", False),
+    ("Write a review report:\nthen delete the class `Summary` from app.py.", False),
+    ("Write a review report and generate a summary while modifying code is forbidden; delete app.py.", False),
+    ('"Delete production app.py."', False),
+    ("`Delete production app.py.`", False),
+    ("`Delete production `app.py`.`", False),
+    ("Please update production app.py.", False),
+    ("The reviewer must delete the class `Summary` from app.py.", False),
+    ("Ask the worker to update production app.py.", False),
+    ('"Update" production app.py.', False),
+    ("`Delete`app.py", False),
+    ("Please urgently update production app.py.", False),
+    ("Write a review report using evidence from app.py, then `delete` production code.", False),
+    ('Write a review report using evidence from app.py, then "delete production app.py".', False),
+    ("Write a review report using the functions named delete and update, then modify production code.", False),
+)
+
+
 def policy_content_candidates(text):
     """Place literal policy text in each of the 21 supported content surfaces."""
     for role in (None,) + KNOWN_ROLES:
@@ -69,6 +129,22 @@ def policy_content_candidates(text):
 
 
 class PromptPolicyTests(unittest.TestCase):
+    def test_directives_have_scoped_objects_and_distinguish_evidence_identifiers(self):
+        for text, accepted in DIRECTIVE_SCOPE_CASES:
+            for role, fragment, candidate in policy_content_candidates(text):
+                with self.subTest(text=text, role=role, fragment=fragment):
+                    if not accepted:
+                        with self.assertRaisesRegex(ValueError, "unsafe"):
+                            normalize_policy_candidate(candidate)
+                        continue
+                    try:
+                        normalized = normalize_policy_candidate(candidate)
+                    except ValueError as exc:
+                        self.fail(f"Review evidence was rejected: {exc}")
+                    actual = normalized if role is None else normalized["role_policies"][role]
+                    for field, value in fragment.items():
+                        self.assertEqual(actual[field], value)
+
     def test_operation_scope_distinguishes_source_objects_from_complete_artifacts(self):
         for text, accepted in OPERATION_SCOPE_CASES:
             for role, fragment, candidate in policy_content_candidates(text):
@@ -563,6 +639,24 @@ class RootCauseGeneratorTests(unittest.TestCase):
         self.assertEqual(generated["candidate"]["role_policies"], {role: {} for role in KNOWN_ROLES})
         self.assertEqual(generated["candidate"]["budget_parameters"], {})
 
+    def test_generator_distinguishes_directives_from_evidence_identifiers(self):
+        for text, accepted in DIRECTIVE_SCOPE_CASES:
+            for role, fragment, candidate in policy_content_candidates(text):
+                with self.subTest(text=text, role=role, fragment=fragment):
+                    generator = RootCauseEvolutionGenerator(self.JsonClient(candidate))
+                    if not accepted:
+                        with self.assertRaisesRegex(ValueError, "unsafe"):
+                            generator.generate([], "Review the diff.")
+                        continue
+                    try:
+                        generated = generator.generate([], "Review the diff.")
+                    except ValueError as exc:
+                        self.fail(f"Review evidence generation was rejected: {exc}")
+                    actual = (generated["candidate"] if role is None
+                              else generated["candidate"]["role_policies"][role])
+                    for field, value in fragment.items():
+                        self.assertEqual(actual[field], value)
+
     def test_generator_preserves_operation_scope_across_content_surfaces(self):
         for text, accepted in OPERATION_SCOPE_CASES:
             for role, fragment, candidate in policy_content_candidates(text):
@@ -586,7 +680,7 @@ class RootCauseGeneratorTests(unittest.TestCase):
             store = TaskStore(os.path.join(root, "scope-generation.db"))
             store.create("failed-review", "org/repo", 1, {})
             store.record_failure_case("failed-review", "missed_issue", {"note": "Missing evidence"})
-            for text, accepted in OPERATION_SCOPE_CASES:
+            for text, accepted in OPERATION_SCOPE_CASES + DIRECTIVE_SCOPE_CASES:
                 if accepted:
                     continue
                 for role, fragment, candidate in policy_content_candidates(text):

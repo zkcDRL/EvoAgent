@@ -32,94 +32,229 @@ _REVIEW_ADVERBS = frozenset((
     "clearly", "specifically", "briefly", "concisely", "directly", "explicitly", "precisely",
 ))
 _REVIEW_FORMATS = frozenset(("json", "yaml", "markdown", "html", "xml", "csv"))
-_REVIEW_MODIFIERS = _SOURCE_HEADS | _REVIEW_FORMATS | frozenset((
+_REVIEW_MODIFIERS = _REVIEW_FORMATS | frozenset((
     "review", "concise", "detailed", "brief", "clear",
 ))
 _EVIDENCE_LINKS = frozenset((
     "for", "based", "about", "describing", "on", "using", "regarding", "concerning", "from",
 ))
-# Consume paths before words so report.py cannot become the review noun report.
-# Only sentence/semicolon boundaries end operation scope. Symbol punctuation
-# (including calls and subscripts), colons and commas remain inside that scope.
-# Quotes/backticks are formatting rather than tokens.
+_DIRECTIVE_LINKS = frozenset((
+    "and", "or", "but", "then", "to", "must", "should", "shall", "may", "can", "will",
+    "would", "could",
+))
+_DIRECTIVE_PREFIXES = _REVIEW_ADVERBS | frozenset(("please", "always", "never", "not"))
+# Keep quoted evidence and code atomic. In particular, an operation identifier
+# inside a literal is not an imperative, and report.py is not a review noun.
 _INSTRUCTION_TOKENS = re.compile(
-    r"(?P<source>[\w./-]+\.py\b|```python\b)|"
-    r"(?P<word>\w+(?:[-']\w+)*)|(?P<boundary>[.!?;])|(?P<symbol>[^\w\s`'\"])")
+    r"(?P<code>```[\s\S]*?(?:```|$))|"
+    r"(?P<quoted>`[^`]*`|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')|"
+    r"(?P<source>[\w./-]+\.py\b)|(?P<identifier>\w+(?:\.\w+)+)|"
+    r"(?P<word>\w+(?:[-']\w+)*)|(?P<boundary>[.!?;])|(?P<symbol>[^\w\s])",
+    re.IGNORECASE,
+)
 
 
-def _review_evidence_start(tokens: list, start: int, end: int):
-    """Recognize complete artifact phrases before granting an evidence link.
+def _token_text(token) -> str:
+    value = token.group()
+    return (value[1:-1] if token.lastgroup == "quoted" else value).lower()
 
-    Source heads may modify an artifact (function analysis), but cannot follow
-    its noun (report function) or introduce a named source symbol. Each member
-    of a coordinated artifact list must satisfy the same bounded grammar.
-    """
+
+def _review_artifact_end(tokens: list, start: int, end: int):
+    """Parse one artifact, retaining identifier/quote boundaries for source heads."""
     index = start
-    while index < end:
-        if tokens[index].group() in ("a", "an", "the"):
-            index += 1
-        while index < end and tokens[index].group() in _REVIEW_MODIFIERS:
-            index += 1
-        if index == end or tokens[index].group() not in _REVIEW_OBJECTS:
-            return None
-        while index < end and tokens[index].group() in _REVIEW_OBJECTS:
-            index += 1
-        while index < end:
-            token = tokens[index].group()
-            if token in _REVIEW_ADVERBS:
-                index += 1
-            elif (token in ("in", "as") and index + 1 < end
-                  and tokens[index + 1].group() in _REVIEW_FORMATS):
-                index += 2
-                if index < end and tokens[index].group() == "format":
-                    index += 1
-            else:
-                break
-        if index == end:
-            return None
-        token = tokens[index].group()
-        if token in _EVIDENCE_LINKS:
-            return index
-        if token == "with" and index + 1 < end and tokens[index + 1].group() == "evidence":
-            return index
-        if token not in ("and", ","):
-            return None
+    if index < end and _token_text(tokens[index]) in ("a", "an", "the"):
         index += 1
-        if token == "," and index < end and tokens[index].group() == "and":
+    while index < end and _token_text(tokens[index]) in _REVIEW_MODIFIERS:
+        index += 1
+    if index < end and _token_text(tokens[index]) in _SOURCE_HEADS:
+        head = tokens[index]
+        index += 1
+        # Source heads modify only explicit artifact constructions. A quoted,
+        # called, or capitalized identifier cannot borrow the artifact noun's
+        # exemption (class `Summary`, function Analysis, function analysis()).
+        if (index == end or tokens[index].lastgroup != "word"
+                or (not tokens[index].group().islower()
+                    and not (head.group().isupper() and tokens[index].group().isupper()))):
+            return None
+        if _token_text(tokens[index]) == "review":
             index += 1
+        elif _token_text(tokens[index]) != "analysis":
+            return None
+        if index == end or tokens[index].lastgroup != "word":
+            return None
+    if index == end or _token_text(tokens[index]) not in _REVIEW_OBJECTS:
+        return None
+    while index < end and _token_text(tokens[index]) in _REVIEW_OBJECTS:
+        index += 1
+    while index < end:
+        token = _token_text(tokens[index])
+        if token in _REVIEW_ADVERBS:
+            index += 1
+        elif (token in ("in", "as") and index + 1 < end
+              and _token_text(tokens[index + 1]) in _REVIEW_FORMATS):
+            index += 2
+            if index < end and _token_text(tokens[index]) == "format":
+                index += 1
+        else:
+            break
+    return index
+
+
+def _review_object_end(tokens: list, start: int, end: int):
+    """Recognize a complete artifact or coordinated artifact list."""
+    index = _review_artifact_end(tokens, start, end)
+    while index is not None and index < end and _token_text(tokens[index]) in ("and", ","):
+        index += 1
+        if index < end and _token_text(tokens[index]) == "and":
+            index += 1
+        index = _review_artifact_end(tokens, index, end)
+    return index
+
+
+def _evidence_link(tokens: list, index: int, end: int) -> bool:
+    return (index < end and (_token_text(tokens[index]) in _EVIDENCE_LINKS
+            or (_token_text(tokens[index]) == "with" and index + 1 < end
+                and _token_text(tokens[index + 1]) == "evidence")))
+
+
+def _call_ends(tokens: list) -> dict:
+    """Index balanced calls/subscripts once, including nested expressions."""
+    ends = {}
+    openings = []
+    for index, match in enumerate(tokens):
+        token = match.group()
+        if token in ("(", "["):
+            openings.append((index, ")" if token == "(" else "]"))
+        elif token in (")", "]"):
+            if openings and token == openings[-1][1]:
+                start, _ = openings.pop()
+                ends[start - 1] = index + 1
+            else:
+                openings.clear()
+    return ends
+
+
+def _identifier_tokens(tokens: list) -> set:
+    """Mark calls and explicit symbol-name lists before looking for directives."""
+    identifiers = set()
+    call_ends = _call_ends(tokens)
+    index = 0
+    while index < len(tokens):
+        end = call_ends.get(index) if tokens[index].lastgroup in ("word", "identifier") else None
+        if end is not None and (tokens[index].end() == tokens[index + 1].start() or end == index + 3):
+            identifiers.update(range(index, end))
+            index = end
+        else:
+            index += 1
+    name_delimiters = _EVIDENCE_LINKS | {"in", "at", "of", "with", "and", ","}
+    for index, token in enumerate(tokens):
+        if _token_text(token) not in _SOURCE_HEADS | {"named", "called"}:
+            continue
+        cursor = index + 1
+        while cursor < len(tokens) and tokens[cursor].lastgroup in ("word", "quoted", "identifier"):
+            end = call_ends.get(cursor, cursor + 1)
+            if end < len(tokens) and _token_text(tokens[end]) not in name_delimiters:
+                break
+            identifiers.update(range(cursor, end))
+            if end == len(tokens) or _token_text(tokens[end]) not in ("and", ","):
+                break
+            cursor = end + 1
+            if cursor < len(tokens) and _token_text(tokens[cursor]) == "and":
+                cursor += 1
+    return identifiers
+
+
+def _directive_lead(tokens: list, index: int, text: str, identifiers: set):
+    """Find a syntactic directive lead, not arbitrary operation words in evidence."""
+    quoted = tokens[index].lastgroup == "quoted"
+    if index in identifiers or (not quoted and (tokens[index].lastgroup != "word"
+                                                or _token_text(tokens[index]) not in _SOURCE_OPERATIONS)):
+        return None
+    if quoted and _token_text(tokens[index]) not in _SOURCE_OPERATIONS:
+        if not any(_token_text(part) in _SOURCE_OPERATIONS
+                   for part in _INSTRUCTION_TOKENS.finditer(tokens[index].group()[1:-1])):
+            return None
+    if index and _token_text(tokens[index - 1]) in _SOURCE_HEADS | {"named", "called"}:
+        return None
+    lead = index
+    while lead and (_token_text(tokens[lead - 1]) in _DIRECTIVE_PREFIXES
+                    or (tokens[lead - 1].lastgroup == "word" and _token_text(tokens[lead - 1]).endswith("ly"))):
+        lead -= 1
+    if not lead:
+        return lead
+    previous = _token_text(tokens[lead - 1])
+    if previous in _DIRECTIVE_LINKS or previous in (",", ":", "("):
+        lead -= 1
+        while lead and _token_text(tokens[lead - 1]) in (",", "and", "then"):
+            lead -= 1
+        return lead
+    if "\n" in text[tokens[lead - 1].end():tokens[lead].start()]:
+        return lead
     return None
 
 
-def _requests_source_change(text: str) -> bool:
-    """Screen each operation through its clause, including subordinate verbs.
+def _source_reference(token) -> bool:
+    return (token.lastgroup in ("source", "code", "identifier")
+            or _token_text(token) in _SOURCE_OBJECTS | _SOURCE_HEADS
+            or (token.lastgroup == "quoted"
+                and re.search(r"[\w./-]+\.py\b", token.group(), re.I) is not None))
 
-    Walk backwards to retain the nearest source target without repeatedly
-    scanning the clause. A nested operation never erases its parent's scope;
-    only a complete output-artifact phrase exempts subsequent input evidence.
-    """
-    tokens = list(_INSTRUCTION_TOKENS.finditer(text))
-    clause_end = len(tokens)
-    source_target = None
+
+def _clause_requests_source_change(tokens: list, text: str) -> bool:
+    if not tokens:
+        return False
+    identifiers = _identifier_tokens(tokens)
+    directives = [(index, lead) for index in range(len(tokens))
+                  if (lead := _directive_lead(tokens, index, text, identifiers)) is not None]
+    source_after = [False] * (len(tokens) + 1)
     for index in range(len(tokens) - 1, -1, -1):
-        match = tokens[index]
-        token = match.group()
-        if match.lastgroup == "boundary":
-            clause_end = index
-            source_target = None
-        elif match.lastgroup == "source" or token in _SOURCE_OBJECTS:
-            source_target = index
-        elif token in _SOURCE_OPERATIONS and source_target is not None:
-            evidence_start = _review_evidence_start(tokens, index + 1, clause_end)
-            if evidence_start is None or source_target < evidence_start:
+        source_after[index] = _source_reference(tokens[index]) or source_after[index + 1]
+    in_evidence = False
+    for position, (index, lead) in enumerate(directives):
+        if tokens[index].lastgroup == "quoted":
+            # A literal after an evidence label stays data. Quoting an actual
+            # directive at the root or after a directive bridge does not hide it.
+            if in_evidence and (tokens[lead].group() == ":"
+                                or (index + 1 < len(tokens) and _token_text(tokens[index + 1]) in ("in", "at", "of"))):
+                continue
+            # Keep the following object in scope even if formatting closes the
+            # quote before it, as in `Delete production `app.py`.`.
+            quoted_directive = (tokens[index].group()[1:-1] + " "
+                                + text[tokens[index].end():tokens[-1].end()])
+            if _requests_source_change(quoted_directive):
                 return True
+            continue
+        # A coordinated/subordinate operation owns its own object. Its evidence
+        # cannot turn an outer source object into a review artifact.
+        end = directives[position + 1][1] if position + 1 < len(directives) else len(tokens)
+        object_end = _review_object_end(tokens, index + 1, end)
+        if object_end is not None and (object_end == end or _evidence_link(tokens, object_end, end)):
+            in_evidence = _evidence_link(tokens, object_end, end)
+            continue
+        if source_after[index + 1]:
+            return True
+        in_evidence = False
     return False
+
+
+def _requests_source_change(text: str) -> bool:
+    """Screen bounded directives and their objects; evidence identifiers are data."""
+    clause = []
+    for token in _INSTRUCTION_TOKENS.finditer(text):
+        if token.lastgroup == "boundary":
+            if _clause_requests_source_change(clause, text):
+                return True
+            clause = []
+        else:
+            clause.append(token)
+    return _clause_requests_source_change(clause, text)
 
 
 def policy_text_is_safe(text: str) -> bool:
     """Deterministic instruction screening, shared with prompt safety checks."""
     lowered = text.lower()
     return not (any(token in lowered for token in FORBIDDEN)
-                or _requests_source_change(lowered)
+                or _requests_source_change(text)
                 or re.search(r"(?:修改|编辑|生成|输出|重写)[^\n]{0,100}(?:源码|源代码)", lowered))
 
 
