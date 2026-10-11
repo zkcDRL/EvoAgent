@@ -2,6 +2,8 @@ import copy
 import hashlib
 import json
 import os
+import shutil
+import sys
 import tempfile
 import unittest
 
@@ -12,7 +14,7 @@ from evoagent.diff_parser import parse_unified_diff
 from evoagent.evolution import EvolutionEngine
 from evoagent.evolution_policy import (
     KNOWN_ROLES, canonical_policy_json, normalize_policy_candidate,
-    policy_budget, policy_sha256,
+    policy_budget, policy_sha256, policy_text_is_safe,
 )
 from evoagent.evolution_v2 import RootCauseEvolutionGenerator
 from evoagent.skills import AgentSkill
@@ -112,6 +114,31 @@ DIRECTIVE_SCOPE_CASES = (
 )
 
 
+BOUNDED_SCOPE_CASES = (
+    ("Delete `app.Summary`.", False),
+    ('Delete "production source code".', False),
+    ('Write a review report using app.py, then "Delete production code" in app.py.', False),
+    ("Write a review report using app.py, then `Delete production code` in app.py.", False),
+    ("Delete app.Summary.", False),
+    ('Delete "app.Summary".', False),
+    ("Delete `production source code`.", False),
+    ("'Delete'app.py", False),
+    ("'Delete'production source code", False),
+    ('"Delete()" in app.py.', False),
+    ("`Delete()` production source code.", False),
+    ('Write a finding using evidence: "delete" in app.py.', True),
+    ("Write a finding using evidence: `delete` in app.py.", True),
+    ('Write a finding describing the string "delete production app.py" in app.py.', True),
+    ('Write\na\nfinding\ndescribing\nthe\nstring\n"delete\nproduction\napp.py"\nin\napp.py.', True),
+    ("Write a finding describing the string 'delete production app.py' in app.py.", True),
+    ('Write a finding describing the string "don\'t delete production app.py" in app.py.', True),
+    ("Write a finding describing `delete()` in app.py.", True),
+    ('Write a finding using evidence: "delete()" in app.py.', True),
+    ('Write a review report using the function named "update" in app.py.', True),
+    ("Write a review report using the function named `update` in app.py.", True),
+)
+
+
 def policy_content_candidates(text):
     """Place literal policy text in each of the 21 supported content surfaces."""
     for role in (None,) + KNOWN_ROLES:
@@ -129,6 +156,52 @@ def policy_content_candidates(text):
 
 
 class PromptPolicyTests(unittest.TestCase):
+    def test_quotes_preserve_source_objects_and_explicit_directive_bridges(self):
+        for text, accepted in BOUNDED_SCOPE_CASES:
+            for role, fragment, candidate in policy_content_candidates(text):
+                with self.subTest(text=text, role=role, fragment=fragment):
+                    if not accepted:
+                        with self.assertRaisesRegex(ValueError, "unsafe"):
+                            normalize_policy_candidate(candidate, strict=True)
+                        continue
+                    try:
+                        normalized = normalize_policy_candidate(candidate, strict=True)
+                    except ValueError as exc:
+                        self.fail(f"Quoted review evidence was rejected: {exc}")
+                    actual = normalized if role is None else normalized["role_policies"][role]
+                    for field, value in fragment.items():
+                        self.assertEqual(actual[field], value)
+
+    def test_quoted_directive_family_has_bounded_parser_work(self):
+        # Re-parsing each quoted directive's suffix doubles the work per quote.
+        # Count executed parser lines rather than depending on machine speed.
+        parser_file = sys.modules[policy_text_is_safe.__module__].__file__
+        for count in (4, 12, 24, 48, 90):
+            quoted = " and ".join(['"Write a summary"'] * count)
+            for text, accepted in ((quoted, True), (quoted + "; Delete app.py.", False)):
+                self.assertLessEqual(len(text), 2000)
+                # Six lexical tokens per item, including quote boundaries and
+                # the conjunction; allow four more for the unsafe final clause.
+                limit = 200 * (6 * count + 3)
+                steps = 0
+
+                def trace(frame, event, arg):
+                    nonlocal steps
+                    if event == "line" and frame.f_code.co_filename == parser_file:
+                        steps += 1
+                        if steps > limit:
+                            raise AssertionError("policy parser exceeded linear work bound")
+                    return trace
+
+                with self.subTest(count=count, accepted=accepted):
+                    previous = sys.gettrace()
+                    try:
+                        sys.settrace(trace)
+                        self.assertEqual(policy_text_is_safe(text), accepted)
+                    finally:
+                        sys.settrace(previous)
+                    self.assertLessEqual(steps, limit)
+
     def test_directives_have_scoped_objects_and_distinguish_evidence_identifiers(self):
         for text, accepted in DIRECTIVE_SCOPE_CASES:
             for role, fragment, candidate in policy_content_candidates(text):
@@ -564,6 +637,55 @@ class RootCauseGeneratorTests(unittest.TestCase):
             ledger.record_model(role, self.provider, self.model,
                                 {"prompt_tokens": 12, "completion_tokens": 8}, 1)
             return self.result
+
+    def test_generator_preserves_quoted_source_and_directive_safety(self):
+        for text, accepted in BOUNDED_SCOPE_CASES:
+            for role, fragment, candidate in policy_content_candidates(text):
+                with self.subTest(text=text, role=role, fragment=fragment):
+                    generator = RootCauseEvolutionGenerator(self.JsonClient(candidate))
+                    if not accepted:
+                        with self.assertRaisesRegex(ValueError, "unsafe"):
+                            generator.generate([], "Review the diff.")
+                        continue
+                    try:
+                        generated = generator.generate([], "Review the diff.")
+                    except ValueError as exc:
+                        self.fail(f"Quoted review evidence generation was rejected: {exc}")
+                    actual = (generated["candidate"] if role is None
+                              else generated["candidate"]["role_policies"][role])
+                    for field, value in fragment.items():
+                        self.assertEqual(actual[field], value)
+
+    def test_quoted_source_directives_never_create_versions_or_runs(self):
+        with tempfile.TemporaryDirectory() as root:
+            template_path = os.path.join(root, "quote-template.db")
+            template = TaskStore(template_path)
+            template.create("failed-review", "org/repo", 1, {})
+            template.record_failure_case("failed-review", "missed_issue", {"note": "Missing evidence"})
+            for case_index, (text, accepted) in enumerate(BOUNDED_SCOPE_CASES):
+                if accepted:
+                    continue
+                for surface, (role, fragment, candidate) in enumerate(policy_content_candidates(text)):
+                    with self.subTest(text=text, role=role, fragment=fragment):
+                        path = os.path.join(root, f"quote-{case_index}-{surface}.db")
+                        # All template writes have committed. Copy the real
+                        # fixture to isolate persistence without repeated migrations.
+                        shutil.copyfile(template_path, path)
+                        store = TaskStore(path)
+                        engine = EvolutionEngine(
+                            store, seed_defaults=False,
+                            candidate_generator=RootCauseEvolutionGenerator(self.JsonClient(candidate)),
+                        )
+                        error = None
+                        try:
+                            engine.auto_propose("llm-review")
+                        except ValueError as exc:
+                            error = exc
+                            self.assertIn("unsafe", str(exc))
+                        self.assertEqual(store.list_skill_versions("llm-review"), [])
+                        self.assertEqual(store.list_evolution_runs(), [])
+                        self.assertEqual(len(store.list_failure_cases(True)), 1)
+                        self.assertIsNotNone(error, "unsafe generation must raise before persistence")
 
     def test_role_candidate_is_normalized_without_leaking_roles_into_prompt_diff(self):
         candidate = {
