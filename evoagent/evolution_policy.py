@@ -23,7 +23,7 @@ _SOURCE_OPERATIONS = frozenset((
     "emit", "write", "generate", "produce",
 ))
 _SOURCE_OBJECTS = frozenset(("source", "source-code", "code", "implementation", "file", "files"))
-_SOURCE_COMPOUNDS = frozenset((
+_SOURCE_HEADS = frozenset((
     "function", "functions", "method", "methods", "class", "classes",
     "module", "modules", "generation",
 ))
@@ -32,57 +32,86 @@ _REVIEW_ADVERBS = frozenset((
     "clearly", "specifically", "briefly", "concisely", "directly", "explicitly", "precisely",
 ))
 _REVIEW_FORMATS = frozenset(("json", "yaml", "markdown", "html", "xml", "csv"))
+_REVIEW_MODIFIERS = _SOURCE_HEADS | _REVIEW_FORMATS | frozenset((
+    "review", "concise", "detailed", "brief", "clear",
+))
+_EVIDENCE_LINKS = frozenset((
+    "for", "based", "about", "describing", "on", "using", "regarding", "concerning", "from",
+))
 # Consume paths before words so report.py cannot become the review noun report.
-# Quotes/backticks are formatting; other punctuation ends an object phrase.
+# Only sentence/semicolon boundaries end operation scope. Symbol punctuation
+# (including calls and subscripts), colons and commas remain inside that scope.
+# Quotes/backticks are formatting rather than tokens.
 _INSTRUCTION_TOKENS = re.compile(
     r"(?P<source>[\w./-]+\.py\b|```python\b)|"
-    r"(?P<word>\w+(?:[-']\w+)*)|(?P<boundary>[^\w\s`'\"])")
+    r"(?P<word>\w+(?:[-']\w+)*)|(?P<boundary>[.!?;])|(?P<symbol>[^\w\s`'\"])")
+
+
+def _review_evidence_start(tokens: list, start: int, end: int):
+    """Recognize complete artifact phrases before granting an evidence link.
+
+    Source heads may modify an artifact (function analysis), but cannot follow
+    its noun (report function) or introduce a named source symbol. Each member
+    of a coordinated artifact list must satisfy the same bounded grammar.
+    """
+    index = start
+    while index < end:
+        if tokens[index].group() in ("a", "an", "the"):
+            index += 1
+        while index < end and tokens[index].group() in _REVIEW_MODIFIERS:
+            index += 1
+        if index == end or tokens[index].group() not in _REVIEW_OBJECTS:
+            return None
+        while index < end and tokens[index].group() in _REVIEW_OBJECTS:
+            index += 1
+        while index < end:
+            token = tokens[index].group()
+            if token in _REVIEW_ADVERBS:
+                index += 1
+            elif (token in ("in", "as") and index + 1 < end
+                  and tokens[index + 1].group() in _REVIEW_FORMATS):
+                index += 2
+                if index < end and tokens[index].group() == "format":
+                    index += 1
+            else:
+                break
+        if index == end:
+            return None
+        token = tokens[index].group()
+        if token in _EVIDENCE_LINKS:
+            return index
+        if token == "with" and index + 1 < end and tokens[index + 1].group() == "evidence":
+            return index
+        if token not in ("and", ","):
+            return None
+        index += 1
+        if token == "," and index < end and tokens[index].group() == "and":
+            index += 1
+    return None
 
 
 def _requests_source_change(text: str) -> bool:
-    """Keep source compounds distinct from review artifacts and their evidence."""
-    awaiting_object = False
-    review_object = False
-    source_compound = False
-    format_end = -1
+    """Screen each operation through its clause, including subordinate verbs.
+
+    Walk backwards to retain the nearest source target without repeatedly
+    scanning the clause. A nested operation never erases its parent's scope;
+    only a complete output-artifact phrase exempts subsequent input evidence.
+    """
     tokens = list(_INSTRUCTION_TOKENS.finditer(text))
-    for index, match in enumerate(tokens):
+    clause_end = len(tokens)
+    source_target = None
+    for index in range(len(tokens) - 1, -1, -1):
+        match = tokens[index]
         token = match.group()
         if match.lastgroup == "boundary":
-            awaiting_object = False
-            review_object = False
-            source_compound = False
-        elif token in _SOURCE_OPERATIONS:
-            awaiting_object = True
-            review_object = False
-            source_compound = False
-        elif awaiting_object:
-            if match.lastgroup == "source" or token in _SOURCE_OBJECTS:
+            clause_end = index
+            source_target = None
+        elif match.lastgroup == "source" or token in _SOURCE_OBJECTS:
+            source_target = index
+        elif token in _SOURCE_OPERATIONS and source_target is not None:
+            evidence_start = _review_evidence_start(tokens, index + 1, clause_end)
+            if evidence_start is None or source_target < evidence_start:
                 return True
-            if token in _SOURCE_COMPOUNDS:
-                source_compound = True
-            if source_compound:
-                # A later review noun may be a source object's name or modifier.
-                continue
-            if token in _REVIEW_OBJECTS:
-                review_object = True
-            elif review_object and (
-                    token in ("for", "based", "about", "describing", "on", "using",
-                              "regarding", "concerning", "from")
-                    or (token == "with" and re.match(r"\s+evidence\b", text[match.end():]))):
-                awaiting_object = False
-            elif review_object:
-                if token in _REVIEW_ADVERBS or index <= format_end:
-                    continue
-                if (token in ("in", "as") and index + 1 < len(tokens)
-                        and tokens[index + 1].group() in _REVIEW_FORMATS):
-                    format_end = index + 1
-                    if index + 2 < len(tokens) and tokens[index + 2].group() == "format":
-                        format_end += 1
-                else:
-                    # Unrecognized continuations may form source compounds;
-                    # unlike output qualifiers, they cannot regain an exemption.
-                    source_compound = True
     return False
 
 

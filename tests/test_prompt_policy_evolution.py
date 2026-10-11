@@ -19,7 +19,72 @@ from evoagent.skills import AgentSkill
 from evoagent.store import TaskStore
 
 
+OPERATION_SCOPE_CASES = (
+    ("Modify the report function to generate a review report using evidence from production app.py.", False),
+    ("Modify the function named report() with evidence validation code in production app.py.", False),
+    ("Write a function analysis based on app.py.", True),
+    ("Write a detailed function review report using evidence from app.py.", True),
+    ("Generate a review report and a summary based on app.py.", True),
+    ("Modify the report function to write a detailed function review report using evidence from app.py.", False),
+    ("Update report generation to produce a JSON review report based on app.py.", False),
+    ("Modify the report function and generate a review report and a summary based on app.py.", False),
+    ("Modify the report function, to generate a review report using evidence from app.py.", False),
+    ("Modify the report function:\n generate a review report using evidence from app.py.", False),
+    ("Modify the method named report(value) using evidence from production app.py.", False),
+    ("Modify the class named Summary[T] to write a review report using evidence from app.py.", False),
+    ("Modify the function named `report()` with evidence validation code in app.py.", False),
+    ("Modify report() using evidence from app.py.", False),
+    ("Modify the function named report() to generate a review report based on app.py.", False),
+    ("MODIFY THE REPORT FUNCTION\nTO GENERATE A REVIEW REPORT USING EVIDENCE FROM APP.PY.", False),
+    ("Modify the function named report\n()\n with evidence validation code in app.py.", False),
+    ("Write a review report based on app.py, then modify the function named report() using evidence from app.py.", False),
+    ("Write a review report using app.py; modify the report function to generate a summary from app.py.", False),
+    ("Modify the function named report analysis using evidence from app.py.", False),
+    ("Write a method analysis based on app.py.", True),
+    ("Write a class review report using evidence from app.py.", True),
+    ("Generate a review report, a finding, and a summary based on app.py.", True),
+    ("Generate a review report and summary in JSON based on app.py.", True),
+    ("Write a detailed function review report in JSON format clearly using evidence from app.py.", True),
+    ("GENERATE A REVIEW REPORT\nAND A SUMMARY BASED ON APP.PY.", True),
+    ("Write a function analysis based on app.py. Generate a summary from app.py.", True),
+    ("Generate a review report and a summary from app.py; update a finding on app.py.", True),
+    ("Generate a review report and an analysis specifically about production report.py.", True),
+)
+
+
+def policy_content_candidates(text):
+    """Place literal policy text in each of the 21 supported content surfaces."""
+    for role in (None,) + KNOWN_ROLES:
+        rule_fields = (("lead_delegation_rules", "tool_selection_policy") if role is None
+                       else ("delegation_rules",) if role == "lead"
+                       else ("tool_selection_policy",))
+        fragments = [
+            {"prompt_additions": [text]},
+            {"few_shot_examples": [{"input": text, "output": "o"}]},
+            {"few_shot_examples": [{"input": "i", "output": text}]},
+        ] + [{field: [{"instructions": text}]} for field in rule_fields]
+        for fragment in fragments:
+            candidate = fragment if role is None else {"role_policies": {role: fragment}}
+            yield role, fragment, candidate
+
+
 class PromptPolicyTests(unittest.TestCase):
+    def test_operation_scope_distinguishes_source_objects_from_complete_artifacts(self):
+        for text, accepted in OPERATION_SCOPE_CASES:
+            for role, fragment, candidate in policy_content_candidates(text):
+                with self.subTest(text=text, role=role, fragment=fragment):
+                    if not accepted:
+                        with self.assertRaisesRegex(ValueError, "unsafe"):
+                            normalize_policy_candidate(candidate)
+                        continue
+                    try:
+                        normalized = normalize_policy_candidate(candidate)
+                    except ValueError as exc:
+                        self.fail(f"Review artifact was rejected: {exc}")
+                    actual = normalized if role is None else normalized["role_policies"][role]
+                    for field, value in fragment.items():
+                        self.assertEqual(actual[field], value)
+
     def test_legacy_normalizes_without_mutation(self):
         candidate = {
             "prompt_additions": ["Review added lines."],
@@ -497,6 +562,44 @@ class RootCauseGeneratorTests(unittest.TestCase):
         self.assertIn("Review app.py for added-line defects.", generated["candidate_prompt"])
         self.assertEqual(generated["candidate"]["role_policies"], {role: {} for role in KNOWN_ROLES})
         self.assertEqual(generated["candidate"]["budget_parameters"], {})
+
+    def test_generator_preserves_operation_scope_across_content_surfaces(self):
+        for text, accepted in OPERATION_SCOPE_CASES:
+            for role, fragment, candidate in policy_content_candidates(text):
+                with self.subTest(text=text, role=role, fragment=fragment):
+                    generator = RootCauseEvolutionGenerator(self.JsonClient(candidate))
+                    if not accepted:
+                        with self.assertRaisesRegex(ValueError, "unsafe"):
+                            generator.generate([], "Review the diff.")
+                        continue
+                    try:
+                        generated = generator.generate([], "Review the diff.")
+                    except ValueError as exc:
+                        self.fail(f"Review artifact generation was rejected: {exc}")
+                    actual = (generated["candidate"] if role is None
+                              else generated["candidate"]["role_policies"][role])
+                    for field, value in fragment.items():
+                        self.assertEqual(actual[field], value)
+
+    def test_unsafe_operation_scope_candidates_never_reach_persistence(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = TaskStore(os.path.join(root, "scope-generation.db"))
+            store.create("failed-review", "org/repo", 1, {})
+            store.record_failure_case("failed-review", "missed_issue", {"note": "Missing evidence"})
+            for text, accepted in OPERATION_SCOPE_CASES:
+                if accepted:
+                    continue
+                for role, fragment, candidate in policy_content_candidates(text):
+                    with self.subTest(text=text, role=role, fragment=fragment):
+                        engine = EvolutionEngine(
+                            store, seed_defaults=False,
+                            candidate_generator=RootCauseEvolutionGenerator(self.JsonClient(candidate)),
+                        )
+                        with self.assertRaisesRegex(ValueError, "unsafe"):
+                            engine.auto_propose("llm-review")
+                        self.assertEqual(store.list_skill_versions("llm-review"), [])
+                        self.assertEqual(store.list_evolution_runs(), [])
+                        self.assertEqual(len(store.list_failure_cases(True)), 1)
 
     def test_generator_distinguishes_review_evidence_from_source_compounds(self):
         cases = (
