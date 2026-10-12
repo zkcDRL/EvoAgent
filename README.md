@@ -240,6 +240,58 @@ Invoke-RestMethod https://<公网域名>/health
 
 `POST /v1/reviews` 的 `diff` 最大默认 1 MiB；单任务默认最多 8 步、120 秒。可通过环境变量调整，详见 `.env.example`。
 
+## Prompt 进化
+
+Prompt 进化需要显式调用 `POST /v1/evolution/auto`（下文简称 `/auto`）或现有的候选评测接口；收集失败反馈不会自动启动后台进化循环。`/auto` 使用失败样本生成候选，`POST /v1/evolution/propose` 仍接受原有的 `skill_name` 和纯文本 `prompt` 请求，并用空的新结构化策略评测该候选。
+
+结构化候选保留全部旧的顶层字段，并可增加 `role_policies`：
+
+```json
+{
+  "prompt_additions": ["只报告新增行引入且有直接证据的问题。"],
+  "few_shot_examples": [],
+  "lead_delegation_rules": [],
+  "tool_selection_policy": [],
+  "budget_parameters": {"security": 4000},
+  "role_policies": {
+    "lead": {"prompt_additions": [], "few_shot_examples": [], "delegation_rules": []},
+    "security": {"prompt_additions": [], "few_shot_examples": [], "tool_selection_policy": []},
+    "correctness-reliability": {"prompt_additions": [], "few_shot_examples": [], "tool_selection_policy": []},
+    "critic": {"prompt_additions": [], "few_shot_examples": [], "tool_selection_policy": []}
+  }
+}
+```
+
+上述 JSON 是生成器候选及持久化策略的结构；现有 `/propose` 的纯文本请求格式没有改为结构化请求。角色键只允许精确的 `lead`、`security`、`correctness-reliability` 和 `critic`，未提供 `role_policies` 时按空角色策略加载。
+
+| 字段 | 分发或执行方式 |
+|---|---|
+| 顶层 `prompt_additions`、`few_shot_examples` | 所有角色共享；全局 prompt 已包含的共享增量不重复渲染 |
+| 顶层 `lead_delegation_rules` | 仅 Lead 接收，保留旧候选兼容性 |
+| 顶层 `tool_selection_policy` | 保留旧的所有角色共享行为；新候选优先放到对应角色下 |
+| 顶层 `budget_parameters` | 按角色控制运行时 token 总预算，绝不渲染为提示词文字 |
+| `role_policies.<role>.prompt_additions`、`few_shot_examples` | 只进入该角色的系统提示词 |
+| `role_policies.lead.delegation_rules` | 只进入 Lead 的分工策略 |
+| 其他三个角色的 `tool_selection_policy` | 只进入对应角色的工具指导；工具权限仍由运行时检查 |
+
+各角色仍使用原有的内置提示词，随后追加生效的全局 prompt、共享旧字段和该角色策略。Lead 选中的 Agent Skill 完整指令只追加给对应的 Security 或 Correctness/Reliability Worker；Lead 和 Critic 不接收 Worker Skill 指令。预算键必须是已知角色，新增值必须是整数；运行时执行 `max(256, min(value, default_token_budget * 4))`，旧数据中的非法值回退到默认预算。
+
+新候选先经过严格的字段、类型、大小和确定性指令检查：每个共享或角色策略最多 20 条 prompt 增量（每条 2000 字符）、10 个少样本示例（每个 input/output 4000 字符）、每个策略规则字段 20 条规则，规范化 JSON 最多 64 KiB。检查覆盖危险指令和要求修改生产源码的指令；这是有明确规则边界的校验，不保证识别任意自然语言攻击。生成器候选不合法时不会创建版本；旧存储策略使用宽松加载，避免新规则使历史版本无法加载或回滚。
+
+配置模型的生产服务用相同的模型、内置角色提示词、Agent Skills、确定性扫描器和默认运行限制，对当前完整策略与候选完整策略分别回放验证集和留出集；两次回放的策略可以各自包含角色预算覆盖。回放复用实际审查流程：
+
+```text
+Lead 分工 → Security / Correctness-Reliability Workers
+         → Lead 评估及最多一轮返工 → Critic 盲审
+         → Lead 最终选择 → FindingGate → 预期 finding 匹配
+```
+
+运行记录以 `full-agent-policy-replay` 标识该模式。只有未配置 `policy_reviewer_factory` 的旧调用方才使用 `legacy-single-reviewer`；已配置的策略工厂或角色、工具执行失败会计入评测错误并阻止激活，不会自动回退到旧回放路径。候选必须达到配置的验证集最小分数提升，保护指标的验证集退化不得超过允许值，留出集也必须通过非退化门禁；留出集只返回汇总指标，案例详情被脱敏。
+
+当前模型根因生成路径通过门禁后返回 `shadow_ready`，等待影子/灰度审批；这一步没有完成后台影子执行或自动晋级。未配置模型或数据不足时仍可返回 `deferred`。仅当该次进化结果为 `activated`，才把其使用的失败案例标记为已解决；`rejected`、`deferred` 和 `shadow_ready` 都保留未解决状态。
+
+一个现有的 `skill_versions` 版本就是全局 prompt 与结构化策略的完整原子包：`skill_versions.prompt` 保存全局文字，对应 `evolution_runs.metrics.structured_candidate.candidate` 保存策略。完整策略先持久化，再切换生效版本；激活、回滚及 `POST /v1/skills/reload` 均按该版本加载匹配策略，不受评测记录列表分页窗口影响。旧版本没有结构化记录时加载空策略。现有路由、请求格式和存储版本继续兼容，SQLite / PostgreSQL 均无需数据库迁移；运行记录保存策略哈希、评测模式及数据指纹用于审计。
+
 ## 架构
 
 ```text
