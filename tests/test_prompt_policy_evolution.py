@@ -136,6 +136,37 @@ BOUNDED_SCOPE_CASES = (
     ('Write a finding using evidence: "delete()" in app.py.', True),
     ('Write a review report using the function named "update" in app.py.', True),
     ("Write a review report using the function named `update` in app.py.", True),
+    ('Write a review report using app.py, then ("Delete production code").', False),
+    ('Write a review report using app.py, then: "Delete production code".', False),
+    ("Write a review report using app.py, then (`Delete production code`).", False),
+    ("Write a review report using app.py, then: `Delete production code`.", False),
+    ("Write a review report using app.py, then ('Delete production code').", False),
+    ("Write a review report using app.py, then: 'Delete production code'.", False),
+    ('Write a review report using app.py, then: (("Delete production code")).', False),
+    ('Write a review report using app.py, then: ("Delete()") in app.py.', False),
+    ("Write a review report using app.py, then: (`Delete()`) in app.py.", False),
+    ('Write a finding describing "delete()" and "update()" in app.py, then: ("Delete production code").', False),
+    ('"Delete()" and "Update()" in app.py.', False),
+    ("`Delete()` and `Update()` in app.py.", False),
+    ("Write a review report using the functions named `delete` and `update` in app.py.", True),
+    ('Write a review report using the functions named "delete" and "update" in app.py.', True),
+    ("Write a review report using the functions named 'delete' and 'update' in app.py.", True),
+    ("Write a finding describing `delete()` and `update()` in app.py.", True),
+    ('Write a finding describing "delete()" and "update()" in app.py.', True),
+    ("Write a finding describing 'delete()' and 'update()' in app.py.", True),
+    ('Write a finding describing delete() and "update()" in app.py.', True),
+    ("Write a review report using the functions named delete and `update` in app.py.", True),
+    ('Write a finding describing "delete()", "update()", and "write()" in app.py.', True),
+    ('Write a review report using the functions named "delete", "update", and "write" in app.py.', True),
+    ('Write a finding using evidence: ("delete production app.py").', True),
+    ('Write a finding describing the string ("delete production app.py").', True),
+    ('Write a review report using app.py, then please ("Delete production code").', False),
+    ('Write a review report using app.py, then: please (`Delete production code`).', False),
+    ('Write a review report using app.py, then urgently: "Delete production code".', False),
+    ('Write a review report using app.py, then: (please: "Delete()") in app.py.', False),
+    ('Write a finding describing the string clearly: ("delete production app.py").', True),
+    ('Write\na\nreview\nreport\nusing\nthe\nfunctions\nnamed\n`delete`\nand\n`update`\nin\napp.py.', True),
+    ('Write\na\nfinding\ndescribing\n"delete()"\nand\n"update()"\nin\napp.py.', True),
 )
 
 
@@ -217,6 +248,51 @@ class PromptPolicyTests(unittest.TestCase):
                     actual = normalized if role is None else normalized["role_policies"][role]
                     for field, value in fragment.items():
                         self.assertEqual(actual[field], value)
+
+    def test_bridge_wrappers_and_quoted_identifier_lists_have_bounded_work(self):
+        # Losing the bridge or the first identifier's evidence ownership makes
+        # these decisions wrong; rescanning either prefix makes work quadratic.
+        parser_file = sys.modules[policy_text_is_safe.__module__].__file__
+        for count in (4, 12, 24, 48, 90):
+            named = ('Write a review report using the functions named '
+                     + " and ".join(['"delete"'] * count) + " in app.py.")
+            calls = ('Write a finding describing '
+                     + " and ".join(['"delete()"'] * count) + " in app.py.")
+            wrapped = ('Write a review report using app.py, then: '
+                       + "(" * count + '"Delete production code"' + ")" * count + ".")
+            prefixed = ('Write a review report using app.py, then: '
+                        + "please (" * count + '"Delete production code"' + ")" * count + ".")
+            families = (
+                (wrapped, False, 2 * count + 18),
+                (prefixed, False, 3 * count + 18),
+                (named, True, 4 * count + 12),
+                (calls, True, 6 * count + 8),
+                (named.replace(" ", "\n"), True, 4 * count + 12),
+                (calls.replace(" ", "\n"), True, 6 * count + 8),
+                (named + ' Then: ("Update production code").', False, 4 * count + 22),
+                (calls[:-1] + ', then: ("Update production code").', False, 6 * count + 18),
+            )
+            for text, accepted, atoms in families:
+                self.assertLessEqual(len(text), 2000)
+                limit = 200 * atoms
+                steps = 0
+
+                def trace(frame, event, arg):
+                    nonlocal steps
+                    if event == "line" and frame.f_code.co_filename == parser_file:
+                        steps += 1
+                        if steps > limit:
+                            raise AssertionError("policy parser exceeded linear work bound")
+                    return trace
+
+                with self.subTest(count=count, text=text, accepted=accepted):
+                    previous = sys.gettrace()
+                    try:
+                        sys.settrace(trace)
+                        self.assertEqual(policy_text_is_safe(text), accepted)
+                    finally:
+                        sys.settrace(previous)
+                    self.assertLessEqual(steps, limit)
 
     def test_operation_scope_distinguishes_source_objects_from_complete_artifacts(self):
         for text, accepted in OPERATION_SCOPE_CASES:

@@ -43,6 +43,7 @@ _DIRECTIVE_LINKS = frozenset((
     "would", "could",
 ))
 _DIRECTIVE_PREFIXES = _REVIEW_ADVERBS | frozenset(("please", "always", "never", "not"))
+_DIRECTIVE_WRAPPERS = frozenset((",", ":", "("))
 # Consume each lexical span once, including path-like spans without a .py
 # suffix. A failed filename match must not rescan a long run of slashes.
 # Quotes retain scope metadata; their contents use the same token stream.
@@ -177,15 +178,27 @@ def _call_ends(tokens: list) -> dict:
 
 
 def _identifier_tokens(tokens: list) -> list:
-    """Index disjoint calls/name lists; mark their intervals in one final pass."""
-    intervals = [0] * (len(tokens) + 1)
+    """Index each identifier's first call/name-list member in bounded passes."""
+    owners = [None] * len(tokens)
     call_ends = _call_ends(tokens)
     index = 0
+    previous_end = None
+    owner = None
     while index < len(tokens):
         end = call_ends.get(index) if tokens[index].kind in ("word", "identifier") else None
         if end is not None and (tokens[index].end == tokens[index + 1].start or end == index + 3):
-            intervals[index] += 1
-            intervals[end] -= 1
+            coordinated = (previous_end is not None
+                           and ((index == previous_end + 1
+                                 and tokens[previous_end].text in ("and", ","))
+                                or (index == previous_end + 2
+                                    and tokens[previous_end].text == ","
+                                    and tokens[previous_end + 1].text == "and")))
+            if not coordinated:
+                owner = index
+            # Call ranges are disjoint because the cursor advances to their end.
+            for member in range(index, end):
+                owners[member] = owner
+            previous_end = end
             index = end
         else:
             index += 1
@@ -197,12 +210,15 @@ def _identifier_tokens(tokens: list) -> list:
             index += 1
             continue
         cursor = index + 1
+        owner = cursor
         while cursor < len(tokens) and tokens[cursor].kind in ("word", "identifier", "source"):
             end = call_ends.get(cursor, cursor + 1)
             if end < len(tokens) and _token_text(tokens[end]) not in name_delimiters:
                 break
-            intervals[cursor] += 1
-            intervals[end] -= 1
+            # Name-list ranges are also disjoint within this pass. Retain the
+            # first member so a quoted successor inherits its evidence origin.
+            for member in range(cursor, end):
+                owners[member] = owner
             cursor = end
             if end == len(tokens) or _token_text(tokens[end]) not in ("and", ","):
                 break
@@ -210,22 +226,18 @@ def _identifier_tokens(tokens: list) -> list:
             if cursor < len(tokens) and _token_text(tokens[cursor]) == "and":
                 cursor += 1
         index = max(index + 1, cursor)
-    identifiers = []
-    depth = 0
-    for interval in intervals[:-1]:
-        depth += interval
-        identifiers.append(depth > 0)
-    return identifiers
+    return owners
 
 
-def _directive_lead(tokens: list, index: int, prefix_starts: list, bridge_starts: list):
+def _directive_lead(tokens: list, index: int, prefix_starts: list,
+                    bridge_starts: list, bridge_directives: list):
     """Use indexed prefix/bridge runs instead of scanning backwards per verb."""
     lead = prefix_starts[index]
     if not lead:
         return lead, True
     previous = _token_text(tokens[lead - 1])
-    if previous in _DIRECTIVE_LINKS or previous in (",", ":", "("):
-        return bridge_starts[lead - 1], previous in _DIRECTIVE_LINKS
+    if previous in _DIRECTIVE_LINKS | _DIRECTIVE_WRAPPERS:
+        return bridge_starts[lead - 1], bridge_directives[lead - 1]
     if tokens[lead - 1].kind == "boundary" or tokens[lead].newline:
         return lead, True
     return None
@@ -240,29 +252,36 @@ def _clause_requests_source_change(tokens: list) -> bool:
     """Index fixed passes, then inspect disjoint directive-object ranges."""
     if not tokens:
         return False
-    identifiers = _identifier_tokens(tokens)
+    identifier_owners = _identifier_tokens(tokens)
     prefix_starts = [0] * len(tokens)
     bridge_starts = [0] * len(tokens)
+    bridge_directives = [False] * len(tokens)
     quote_starts = {}
     directives = []
+    bridge_continues = False
     for index, token in enumerate(tokens):
         prefix_starts[index] = index
         if index and (_token_text(tokens[index - 1]) in _DIRECTIVE_PREFIXES
                       or (tokens[index - 1].kind == "word" and tokens[index - 1].text.endswith("ly"))):
             prefix_starts[index] = prefix_starts[index - 1]
         bridge_starts[index] = index
-        if index and token.text in (",", "and", "then") and tokens[index - 1].text in (",", "and", "then"):
+        bridge_directives[index] = token.text in _DIRECTIVE_LINKS
+        bridge_member = (token.text in _DIRECTIVE_LINKS | _DIRECTIVE_WRAPPERS | _DIRECTIVE_PREFIXES
+                         or (token.kind == "word" and token.text.endswith("ly")))
+        if index and bridge_member and bridge_continues:
             bridge_starts[index] = bridge_starts[index - 1]
+            bridge_directives[index] |= bridge_directives[index - 1]
+        bridge_continues = bridge_member
         if token.quote is not None:
             quote_starts.setdefault(token.quote, index)
         # Calls/name syntax identifies unquoted code. A quoted operation at a
         # directive lead still needs the enclosing evidence grammar below.
-        if ((identifiers[index] and token.quote is None)
+        if ((identifier_owners[index] is not None and token.quote is None)
                 or token.kind != "word" or token.text not in _SOURCE_OPERATIONS):
             continue
         if index and tokens[index - 1].text in _SOURCE_HEADS | {"named", "called"}:
             continue
-        lead = _directive_lead(tokens, index, prefix_starts, bridge_starts)
+        lead = _directive_lead(tokens, index, prefix_starts, bridge_starts, bridge_directives)
         if lead is not None:
             directives.append((index, lead[0]))
     source_after = [False] * (len(tokens) + 1)
@@ -274,12 +293,21 @@ def _clause_requests_source_change(tokens: list) -> bool:
         quote = tokens[index].quote
         if quote is not None and in_evidence:
             start = quote_starts[quote]
-            origin = _directive_lead(tokens, start, prefix_starts, bridge_starts)
+            owner = identifier_owners[index]
+            origin_start = (start if owner is None
+                            else quote_starts.get(tokens[owner].quote, owner))
+            origin = _directive_lead(tokens, origin_start,
+                                     prefix_starts, bridge_starts, bridge_directives)
             # The enclosing evidence grammar owns the entire literal. An
             # explicit bridge at its opening instead establishes a directive.
             data_label = (start and tokens[start - 1].text
                           in _EVIDENCE_LINKS | {"string", "literal", "evidence"})
-            if data_label or origin is None or not origin[1]:
+            # A list's established evidence/name label remains authoritative
+            # across newlines, even when the later member opens another quote.
+            owner_label = (owner is not None and origin_start
+                           and tokens[origin_start - 1].text
+                           in _EVIDENCE_LINKS | _SOURCE_HEADS | {"named", "called", "evidence"})
+            if data_label or owner_label or origin is None or not origin[1]:
                 evidence_quotes.add(quote)
         if quote in evidence_quotes:
             continue
