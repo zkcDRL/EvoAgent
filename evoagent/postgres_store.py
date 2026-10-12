@@ -440,6 +440,20 @@ class PostgresTaskStore:
             value["created_at"] = value["created_at"].isoformat()
         return values
 
+    def get_evolution_run_for_version(self, skill_name: str, version: int) -> Optional[Dict[str, Any]]:
+        """Load a bundle's run independently of the bounded audit-list window."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM evolution_runs WHERE skill_name=%s AND candidate_version=%s "
+                "ORDER BY created_at DESC,id DESC LIMIT 1", (skill_name, version),
+            ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        value["metrics"] = value.pop("metrics_json")
+        value["created_at"] = value["created_at"].isoformat()
+        return value
+
     def update_evolution_run(self, run_id: str, decision: str, metrics: Dict[str, Any]) -> bool:
         with self._connect() as conn:
             cursor = conn.execute(
