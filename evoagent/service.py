@@ -6,7 +6,8 @@ from .agentic_core import AgenticReviewer
 from .auth import AuthManager
 from .config import Settings
 from .context_manager import ContextManager
-from .evolution import EvolutionEngine
+from .evolution import AgentPolicyReplayReviewer, EvolutionEngine
+from .evolution_policy import normalize_policy_candidate
 from .evolution_v2 import RootCauseEvolutionGenerator
 from .fixer import SafeFixer
 from .patching import SuggestionOnlyFixer, VerifiedPatchFixer
@@ -99,6 +100,7 @@ class ReviewService:
         self.evolution = EvolutionEngine(
             self.store,
             reviewer_factory=self._build_llm_reviewer if self.llm_config else None,
+            policy_reviewer_factory=self._build_policy_replay_reviewer if self.llm_config else None,
             min_cases=settings.eval_min_cases,
             max_cases=settings.eval_max_cases,
             min_improvement=settings.eval_min_improvement,
@@ -141,6 +143,31 @@ class ReviewService:
             extra_headers=dict(self.llm_config.get("headers") or {}),
         )
 
+    def _structured_prompt_policy(self, version: Optional[int]) -> dict:
+        candidate = {}
+        if version is not None:
+            run = self.store.get_evolution_run_for_version("llm-review", version)
+            if run:
+                structured = (run.get("metrics") or {}).get("structured_candidate") or {}
+                if isinstance(structured, dict):
+                    candidate = structured.get("candidate", {})
+        return normalize_policy_candidate(candidate, strict=False)
+
+    def _deterministic_scanners(self) -> list:
+        return [
+            item for item in self.registry.reviewers()
+            if not isinstance(item, OpenAICompatibleReviewer)
+        ]
+
+    def _build_policy_replay_reviewer(self, policy_spec: dict) -> AgentPolicyReplayReviewer:
+        return AgentPolicyReplayReviewer(
+            policy_spec, self.chat_client,
+            self.settings.agent_token_budget,
+            self.settings.agent_time_budget_seconds,
+            scanners=self._deterministic_scanners(),
+            skill_provider=self._active_agent_skills,
+        )
+
     def _build_agentic_reviewer(self) -> AgenticReviewer:
         enabled = {
             item.strip() for item in self.settings.enabled_agents.split(",") if item.strip()
@@ -151,17 +178,9 @@ class ReviewService:
         if unknown:
             raise ValueError("unsupported enabled Agent role(s): %s" % ", ".join(sorted(unknown)))
         active_prompt = self.store.get_active_skill_version("llm-review")
-        structured_config = {}
-        if active_prompt:
-            run = next((
-                item for item in self.store.list_evolution_runs(200)
-                if int(item.get("candidate_version") or 0) == int(active_prompt["version"])
-                and (item.get("metrics") or {}).get("structured_candidate")
-            ), None)
-            if run:
-                structured_config = (
-                    run["metrics"]["structured_candidate"].get("candidate") or {}
-                )
+        structured_config = self._structured_prompt_policy(
+            active_prompt["version"] if active_prompt else None
+        )
         return AgenticReviewer(
             self.store, self.chat_client,
             self.settings.agent_token_budget,
@@ -169,10 +188,7 @@ class ReviewService:
             self.settings.llm_input_cost_per_million,
             self.settings.llm_output_cost_per_million,
             enabled,
-            [
-                item for item in self.registry.reviewers()
-                if not isinstance(item, OpenAICompatibleReviewer)
-            ],
+            self._deterministic_scanners(),
             None,
             self.settings.repair_test_command,
             active_prompt["prompt"] if active_prompt else "",

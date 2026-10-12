@@ -21,6 +21,8 @@ from evoagent.evolution_v2 import RootCauseEvolutionGenerator
 from evoagent.skills import AgentSkill
 from evoagent.store import TaskStore
 from evoagent.models import Finding, Severity
+from evoagent.config import Settings
+from evoagent.service import ReviewService
 
 
 OPERATION_SCOPE_CASES = (
@@ -1622,6 +1624,80 @@ class EvolutionEnginePolicyTests(unittest.TestCase):
         result = engine.propose("llm-review", prompt)
         self.assertEqual(result["decision"], "rejected")
         self.assertEqual(len(self.store.list_skill_versions("llm-review")), 1)
+
+
+class ServicePolicyIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        settings = Settings(
+            host="127.0.0.1", port=8080,
+            db_path=os.path.join(self.directory.name, "service.db"),
+            max_diff_bytes=10000, max_steps=8, timeout_seconds=10,
+            llm_base_url="", llm_api_key="", llm_model="",
+            github_webhook_secret="", github_token="", auto_post_review=False,
+        )
+        self.service = ReviewService(settings)
+        self.addCleanup(self.service.queue.close)
+
+    def save_run(self, skill_name, version, candidate, decision="rejected"):
+        self.service.store.save_evolution_run({
+            "id": "%s-%s" % (skill_name, version), "skill_name": skill_name,
+            "candidate_version": version, "baseline_version": None,
+            "decision": decision, "candidate_score": 0.0, "baseline_score": 0.0,
+            "metrics": {"structured_candidate": {"candidate": candidate}},
+            "created_at": "2026-10-12T00:00:00Z",
+        })
+
+    def test_legacy_active_prompt_without_run_loads_empty_policy(self):
+        version = self.service.store.save_skill_version("llm-review", "legacy", 0.0, True)
+        self.service.reload_skills()
+        self.assertEqual(self.service.reviewer.prompt_overlay, "legacy")
+        self.assertEqual(self.service._structured_prompt_policy(version["version"]),
+                         normalize_policy_candidate({}))
+        self.assertEqual(self.service.reviewer.structured_config,
+                         normalize_policy_candidate({}))
+
+    def test_active_bundle_uses_exact_version_even_beyond_audit_window(self):
+        active = self.service.store.save_skill_version("llm-review", "active", 0.0, True)
+        chosen = {"role_policies": {"security": {"prompt_additions": ["ACTIVE_MARKER"]}}}
+        self.save_run("llm-review", active["version"], chosen, "shadow_ready")
+        other = self.service.store.save_skill_version("llm-review", "other", 0.0, False)
+        self.save_run("llm-review", other["version"],
+                      {"role_policies": {"security": {"prompt_additions": ["OTHER_MARKER"]}}})
+        self.save_run("different-skill", active["version"],
+                      {"role_policies": {"security": {"prompt_additions": ["WRONG_SKILL"]}}})
+        for index in range(201):
+            self.service.store.save_evolution_run({
+                "id": "newer-%s" % index, "skill_name": "different-skill",
+                "candidate_version": index + 10, "baseline_version": None,
+                "decision": "rejected", "candidate_score": 0.0, "baseline_score": 0.0,
+                "metrics": {}, "created_at": "2026-10-13T00:00:00Z",
+            })
+        self.service.reload_skills()
+        self.assertEqual(self.service.reviewer.structured_config,
+                         normalize_policy_candidate(chosen))
+        self.assertIn("ACTIVE_MARKER", self.service.reviewer._role_prompt("security"))
+        self.assertNotIn("OTHER_MARKER", self.service.reviewer._role_prompt("security"))
+
+    def test_explicit_activation_and_legacy_rollback_reload_complete_bundle(self):
+        legacy = self.service.store.save_skill_version("llm-review", "legacy", 0.0, True)
+        candidate = self.service.store.save_skill_version("llm-review", "candidate", 0.0, False)
+        old_shape = {"unknown": "ignored", "role_policies": {
+            "critic": {"prompt_additions": ["BUNDLE_MARKER"]}}}
+        self.save_run("llm-review", candidate["version"], old_shape, "rejected")
+        self.assertTrue(self.service.evolution.rollback("llm-review", candidate["version"]))
+        self.service.reload_skills()
+        self.assertEqual(self.service.reviewer.prompt_overlay, "candidate")
+        self.assertIn("BUNDLE_MARKER", self.service.reviewer._role_prompt("critic"))
+        self.assertEqual(self.service.reviewer.structured_config,
+                         normalize_policy_candidate(old_shape, strict=False))
+        self.assertTrue(self.service.evolution.rollback("llm-review", legacy["version"]))
+        self.service.reload_skills()
+        self.assertEqual(self.service.reviewer.prompt_overlay, "legacy")
+        self.assertNotIn("BUNDLE_MARKER", self.service.reviewer._role_prompt("critic"))
+        self.assertEqual(self.service.reviewer.structured_config,
+                         normalize_policy_candidate({}))
 
 
 if __name__ == "__main__":
