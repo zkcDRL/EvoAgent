@@ -11,7 +11,8 @@ from evoagent.agentic_core import (
     AgenticReviewer, CRITIC_PROMPT, LEAD_PROMPT, RELIABILITY_PROMPT, SECURITY_PROMPT,
 )
 from evoagent.diff_parser import parse_unified_diff
-from evoagent.evolution import EvolutionEngine
+from evoagent import evolution
+from evoagent.evolution import DEFAULT_PROMPT, EvolutionEngine, RegressionEvaluator
 from evoagent.evolution_policy import (
     KNOWN_ROLES, canonical_policy_json, normalize_policy_candidate,
     policy_budget, policy_sha256, policy_text_is_safe,
@@ -19,6 +20,7 @@ from evoagent.evolution_policy import (
 from evoagent.evolution_v2 import RootCauseEvolutionGenerator
 from evoagent.skills import AgentSkill
 from evoagent.store import TaskStore
+from evoagent.models import Finding, Severity
 
 
 OPERATION_SCOPE_CASES = (
@@ -1118,6 +1120,508 @@ class RuntimePromptRoutingTests(unittest.TestCase):
             security_feedback = [task["lead_feedback"] for role, _prompt, task in client.calls
                                  if role == "security"]
             self.assertEqual(security_feedback, ["", "Verify the changed-line evidence"])
+
+
+class PolicyGraphClient:
+    """Replace only model I/O; collaboration, tools and finding gates stay real."""
+
+    provider = "fake"
+    model = "policy-replay"
+
+    def __init__(self, reject_critic=False, reject_lead=False, fail_role=""):
+        self.calls = []
+        self.reject_critic = reject_critic
+        self.reject_lead = reject_lead
+        self.fail_role = fail_role
+
+    def complete_json(self, role, system, user, ledger=None, max_tokens=None):
+        task = json.loads(json.loads(user)["task"])
+        self.calls.append((role, system, task))
+        if role == self.fail_role:
+            raise RuntimeError("%s provider unavailable" % role)
+        ledger.record_model(role, self.provider, self.model,
+                            {"prompt_tokens": 10, "completion_tokens": 5}, 1)
+        if role == "lead":
+            if task["phase"] == "delegate":
+                return {"action": "final", "risk_level": "high", "delegations": [
+                    {"assignment_id": "security-1", "worker": "security",
+                     "objective": "Trace input", "skills": ["trace-skill"]},
+                    {"assignment_id": "reliability-1", "worker": "correctness-reliability",
+                     "objective": "Review behavior"},
+                ]}
+            if task["phase"] == "assess-workers":
+                return {"action": "final", "revision_requests": [],
+                        "critic_objective": "Challenge each defect"}
+            if task["phase"] == "finalize":
+                accepted = ([] if self.reject_lead else [item["finding_index"]
+                            for item in task["critic_decisions"] if item["accepted"]])
+                return {"action": "final", "accepted_finding_indices": accepted,
+                        "confidence_adjustments": [], "resolution_summary": "Verified"}
+        if role == "security" and "TRACE_INPUT_POLICY" in system:
+            return {"action": "final", "findings": [
+                {"rule_id": "POLICY-INPUT", "severity": "high", "title": "Unsafe input",
+                 "explanation": "Input reaches the changed call", "path": "app.py", "line": 1,
+                 "evidence": "custom_call(data)", "fix": "Validate data",
+                 "test": "Reject malicious input", "confidence": 0.9,
+                 "call_chain": [{"path": "app.py", "line": 1, "symbol": "custom_call"}]},
+                {"rule_id": "POLICY-UNSUPPORTED", "severity": "medium", "title": "Uncertain",
+                 "explanation": "Insufficient confidence", "path": "app.py", "line": 1,
+                 "evidence": "custom_call(data)", "fix": "Validate data",
+                 "test": "Test boundary", "confidence": 0.1},
+            ]}
+        if role in ("security", "correctness-reliability"):
+            return {"action": "final", "findings": []}
+        if role == "critic":
+            return {"action": "final", "decisions": [
+                {"finding_index": item["finding_index"], "accepted": not self.reject_critic,
+                 "objections": [], "confidence_adjustment": 0.0}
+                for item in task["candidates"]
+            ]}
+        raise AssertionError((role, task))
+
+
+class PolicyReplayTests(unittest.TestCase):
+    diff = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+custom_call(data)\n"
+    policy = {"role_policies": {"security": {"prompt_additions": ["TRACE_INPUT_POLICY"]}}}
+
+    def adapter(self, client=None, **kwargs):
+        adapter_type = getattr(evolution, "AgentPolicyReplayReviewer", None)
+        self.assertIsNotNone(adapter_type, "Task 4 requires a production graph replay adapter")
+        return adapter_type({"prompt": DEFAULT_PROMPT, "structured_config": self.policy},
+                            client or PolicyGraphClient(), **kwargs)
+
+    def test_replay_runs_production_phases_skills_scanners_and_finding_gate(self):
+        class Scanner:
+            name = "extra-scanner"
+
+            def review(self, diff, parsed):
+                return []
+
+        client = PolicyGraphClient()
+        skill = AgentSkill("trace-skill", "Trace input", "TRACE_SKILL", "TRACE_SKILL")
+        adapter = self.adapter(client, token_budget=12000, time_budget_seconds=23,
+                               scanners=[Scanner()], skill_provider=lambda _tenant: [skill])
+        findings = adapter.review(self.diff, parse_unified_diff(self.diff))
+        self.assertEqual([item.rule_id for item in findings], ["POLICY-INPUT"])
+        self.assertTrue(findings[0].gate["passed"])
+        execution = adapter.evaluation_execution()
+        collaboration = adapter.evaluation_collaboration()
+        self.assertEqual(execution["llm_calls"], 6)
+        self.assertEqual([task["phase"] for role, _prompt, task in client.calls if role == "lead"],
+                         ["delegate", "assess-workers", "finalize"])
+        self.assertEqual(collaboration["roles"], list(KNOWN_ROLES))
+        self.assertEqual(collaboration["candidate_findings_before_critic"], 2)
+        self.assertEqual(collaboration["accepted_findings"], 2)
+        self.assertTrue(any(item["event"] == "completed" and item["rejected"] == 1
+                            for item in execution["agent_traces"]["evidence-gate"]))
+        self.assertIn("extra-scanner", [item["tool"] for item in execution["tool_call_log"]])
+        for role, prompt, task in client.calls:
+            self.assertEqual("TRACE_INPUT_POLICY" in prompt, role == "security")
+            self.assertEqual("TRACE_SKILL" in prompt, role == "security")
+        config = adapter.evaluation_config()
+        self.assertEqual(config["mode"], "agentic")
+        self.assertEqual(config["roles"], list(KNOWN_ROLES))
+        self.assertEqual(config["per_role_token_budget"], 12000)
+        self.assertEqual(config["per_role_time_budget_seconds"], 23)
+
+    def test_evaluation_snapshots_and_policy_input_are_copy_safe(self):
+        adapter_type = getattr(evolution, "AgentPolicyReplayReviewer", None)
+        self.assertIsNotNone(adapter_type, "Task 4 requires a production graph replay adapter")
+        spec = {"prompt": DEFAULT_PROMPT, "structured_config": copy.deepcopy(self.policy)}
+        adapter = adapter_type(spec, PolicyGraphClient())
+        spec["structured_config"]["role_policies"]["security"]["prompt_additions"].clear()
+        self.assertEqual(len(adapter.review(self.diff, parse_unified_diff(self.diff))), 1)
+        original = [adapter.evaluation_execution(), adapter.evaluation_collaboration(),
+                    adapter.evaluation_config()]
+        execution = adapter.evaluation_execution()
+        execution["model_call_log"][0]["role"] = "corrupted"
+        adapter.evaluation_collaboration()["assignments"][0]["skills"].append("corrupted")
+        adapter.evaluation_config()["roles"].clear()
+        self.assertEqual(original, [adapter.evaluation_execution(), adapter.evaluation_collaboration(),
+                                    adapter.evaluation_config()])
+        previous_id = adapter._last_task_id
+        adapter.review(self.diff, parse_unified_diff(self.diff))
+        self.assertNotEqual(adapter._last_task_id, previous_id)
+        self.assertEqual(adapter.evaluation_execution()["llm_calls"], 6)
+
+    def test_worker_and_scanner_failures_are_evaluation_errors(self):
+        class BrokenScanner:
+            name = "broken-scanner"
+
+            def review(self, diff, parsed):
+                raise RuntimeError("scanner unavailable")
+
+        for client, scanners in ((PolicyGraphClient(fail_role="security"), []),
+                                 (PolicyGraphClient(), [BrokenScanner()])):
+            with self.subTest(scanners=bool(scanners)), self.assertRaisesRegex(RuntimeError, "replay"):
+                self.adapter(client, scanners=scanners).review(self.diff, parse_unified_diff(self.diff))
+
+    def test_worker_failure_repaired_by_revision_still_fails_replay(self):
+        class RevisedClient(PolicyGraphClient):
+            security_calls = 0
+
+            def complete_json(self, role, system, user, ledger=None, max_tokens=None):
+                if role == "security":
+                    self.security_calls += 1
+                    if self.security_calls == 1:
+                        raise RuntimeError("initial worker failed")
+                result = super().complete_json(role, system, user, ledger, max_tokens)
+                task = json.loads(json.loads(user)["task"])
+                if role == "lead" and task["phase"] == "assess-workers":
+                    result["revision_requests"] = [{"assignment_id": "security-1",
+                        "worker": "security", "guidance": "Verify input evidence", "required_evidence": []}]
+                return result
+
+        adapter = self.adapter(RevisedClient())
+        with self.assertRaisesRegex(RuntimeError, "replay"):
+            adapter.review(self.diff, parse_unified_diff(self.diff))
+        self.assertEqual(adapter.evaluation_collaboration()["revision_rounds"], 1)
+
+    def test_unavailable_tool_recovered_by_worker_still_fails_replay(self):
+        class ToolClient(PolicyGraphClient):
+            security_calls = 0
+
+            def complete_json(self, role, system, user, ledger=None, max_tokens=None):
+                if role == "security":
+                    self.security_calls += 1
+                    if self.security_calls == 1:
+                        return {"action": "tool", "tool": "unavailable-tool",
+                                "arguments": {}, "reason": "Verify evidence"}
+                return super().complete_json(role, system, user, ledger, max_tokens)
+
+        adapter = self.adapter(ToolClient())
+        with self.assertRaisesRegex(RuntimeError, "replay"):
+            adapter.review(self.diff, parse_unified_diff(self.diff))
+
+    def test_critic_and_lead_rejections_do_not_publish_worker_findings(self):
+        for client in (PolicyGraphClient(reject_critic=True), PolicyGraphClient(reject_lead=True)):
+            with self.subTest(critic=client.reject_critic):
+                adapter = self.adapter(client)
+                self.assertEqual(adapter.review(self.diff, parse_unified_diff(self.diff)), [])
+
+
+class EvolutionEnginePolicyTests(unittest.TestCase):
+    diff = PolicyReplayTests.diff
+    policy = PolicyReplayTests.policy
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.store = TaskStore(os.path.join(self.directory.name, "evolution.db"))
+        self.store.save_evaluation_case("confirmed-input", "validation", self.diff,
+            [{"path": "app.py", "line": 1, "rule_id": "POLICY-INPUT", "min_severity": "high"}], "test")
+        self.specs = []
+
+    def factory(self, spec):
+        self.specs.append(copy.deepcopy(spec))
+        return evolution.AgentPolicyReplayReviewer(spec, PolicyGraphClient())
+
+    def engine(self, **kwargs):
+        options = {"policy_reviewer_factory": self.factory, "min_cases": 1,
+                   "max_cases": 5, "seed_defaults": False}
+        options.update(kwargs)
+        try:
+            return EvolutionEngine(self.store, **options)
+        except TypeError as exc:
+            self.fail("EvolutionEngine must support complete policy replay: %s" % exc)
+
+    def saved_run(self, skill_name, version, policy):
+        run = {"id": "%s-%s" % (skill_name, version), "skill_name": skill_name,
+               "candidate_version": version, "baseline_version": None,
+               "decision": "activated", "candidate_score": 0.0, "baseline_score": 0.0,
+               "created_at": "2026-10-12T00:00:00Z",
+               "metrics": {"structured_candidate": {"candidate": policy}}}
+        self.store.save_evolution_run(run)
+
+    def propose_policy(self, engine, policy=None, prompt=DEFAULT_PROMPT):
+        return engine._propose("llm-review", prompt, None,
+                               structured_candidate={"candidate": policy if policy is not None else self.policy})
+
+    def test_security_role_only_improvement_activates_one_complete_version(self):
+        active = self.store.save_skill_version("llm-review", DEFAULT_PROMPT, 0.0, True)
+        engine = self.engine(reviewer_factory=lambda _prompt: self.fail("legacy replay selected"))
+        result = self.propose_policy(engine)
+        self.assertEqual(result["decision"], "activated")
+        self.assertEqual(result["version"]["version"], active["version"] + 1)
+        self.assertEqual(result["candidate"]["recall"], 1.0)
+        self.assertEqual(result["baseline"]["recall"], 0.0)
+        self.assertEqual(self.specs, [
+            {"prompt": DEFAULT_PROMPT, "structured_config": normalize_policy_candidate({})},
+            {"prompt": DEFAULT_PROMPT, "structured_config": normalize_policy_candidate(self.policy)},
+        ])
+        persisted = self.store.list_evolution_runs()[0]["metrics"]
+        self.assertEqual(persisted["evaluation_mode"], "full-agent-policy-replay")
+        for gate in ("role_policy_valid", "role_policy_safe", "evaluation_success"):
+            self.assertIs(persisted["gates"][gate], True)
+        self.assertEqual(persisted["gates"]["evaluation_mode"], "full-agent-policy-replay")
+        repro = persisted["reproducibility"]
+        self.assertEqual(repro["candidate_policy_sha256"], policy_sha256(self.policy))
+        self.assertEqual(repro["baseline_policy_sha256"], policy_sha256({}))
+        self.assertEqual(repro["evaluation_mode"], "full-agent-policy-replay")
+        self.assertEqual(persisted["structured_candidate"]["candidate"], normalize_policy_candidate(self.policy))
+        self.assertEqual(self.store.get_active_skill_version("llm-review")["version"], 2)
+        self.assertTrue(engine.rollback("llm-review", 1))
+        self.assertEqual(self.store.get_active_skill_version("llm-review")["version"], 1)
+
+    def test_identical_prompt_and_policy_is_noop(self):
+        active = self.store.save_skill_version("llm-review", DEFAULT_PROMPT, 1.0, True)
+        self.saved_run("llm-review", active["version"], self.policy)
+        result = self.propose_policy(self.engine())
+        self.assertEqual(result["decision"], "deferred")
+        self.assertIsNone(result["run_id"])
+        self.assertEqual(self.specs, [])
+        self.assertEqual(len(self.store.list_skill_versions("llm-review")), 1)
+
+    def test_baseline_uses_only_matching_active_version_run(self):
+        baseline = {"role_policies": {"critic": {"prompt_additions": ["ACTIVE_CRITIC_POLICY"]}}}
+        active = self.store.save_skill_version("llm-review", DEFAULT_PROMPT, 0.0, True)
+        self.saved_run("llm-review", active["version"], baseline)
+        inactive = self.store.save_skill_version("llm-review", DEFAULT_PROMPT, 0.0, False)
+        self.saved_run("llm-review", inactive["version"], self.policy)
+        self.saved_run("another-skill", active["version"], self.policy)
+        result = self.propose_policy(self.engine())
+        self.assertEqual(result["decision"], "activated")
+        self.assertEqual(self.specs[0]["structured_config"], normalize_policy_candidate(baseline))
+
+    def test_active_baseline_policy_survives_more_than_200_newer_runs(self):
+        baseline = {"role_policies": {"critic": {"prompt_additions": ["OLD_ACTIVE_POLICY"]}}}
+        active = self.store.save_skill_version("llm-review", DEFAULT_PROMPT, 0.0, True)
+        self.saved_run("llm-review", active["version"], baseline)
+        for index in range(201):
+            self.store.save_evolution_run({"id": "newer-%s" % index, "skill_name": "other-skill",
+                "candidate_version": index + 1, "baseline_version": None, "decision": "rejected",
+                "candidate_score": 0.0, "baseline_score": 0.0, "metrics": {},
+                "created_at": "2026-10-13T00:00:00Z"})
+        self.propose_policy(self.engine())
+        self.assertEqual(self.specs[0]["structured_config"], normalize_policy_candidate(baseline))
+
+    def test_legacy_baseline_is_loaded_permissively_and_can_roll_back(self):
+        legacy = {"unknown": "discard", "few_shot_examples": [
+            {"input": "legacy", "output": "evidence", "rationale": "old metadata"}],
+            "role_policies": {"critic": {"prompt_additions": ["a" * 2001]}},
+            "budget_parameters": {"security": "old value"}}
+        active = self.store.save_skill_version("llm-review", DEFAULT_PROMPT, 0.0, True)
+        self.saved_run("llm-review", active["version"], legacy)
+        result = self.propose_policy(self.engine())
+        self.assertEqual(result["decision"], "activated")
+        self.assertEqual(self.specs[0]["structured_config"], normalize_policy_candidate(legacy, strict=False))
+        self.assertTrue(self.engine().rollback("llm-review", active["version"]))
+
+    def test_plain_propose_keeps_signature_and_clears_new_role_policy(self):
+        active = self.store.save_skill_version("llm-review", DEFAULT_PROMPT, 0.0, True)
+        self.saved_run("llm-review", active["version"], self.policy)
+        result = self.engine().propose("llm-review", DEFAULT_PROMPT, 99.0)
+        self.assertEqual(result["decision"], "rejected")
+        self.assertEqual(self.specs[0]["structured_config"], normalize_policy_candidate(self.policy))
+        self.assertEqual(self.specs[1]["structured_config"], normalize_policy_candidate({}))
+        self.assertTrue(self.store.list_evolution_runs()[0]["metrics"]["external_regression_score_ignored"])
+
+    def test_legacy_reviewer_is_used_only_without_policy_factory(self):
+        class LegacyReviewer:
+            def __init__(self, prompt):
+                if not isinstance(prompt, str):
+                    raise AssertionError("legacy callers require prompt strings")
+
+            def review(self, diff, parsed):
+                return []
+
+        result = self.engine(policy_reviewer_factory=None, reviewer_factory=LegacyReviewer).propose(
+            "llm-review", DEFAULT_PROMPT + " Check input.")
+        self.assertEqual(result["decision"], "rejected")
+        metrics = self.store.list_evolution_runs()[0]["metrics"]
+        self.assertEqual(metrics["evaluation_mode"], "legacy-single-reviewer")
+        self.assertEqual(metrics["candidate"]["errors"], [])
+
+    def test_factory_and_role_failures_are_counted_without_legacy_retry(self):
+        def broken_factory(_spec):
+            raise RuntimeError("factory unavailable")
+
+        def failed_worker_factory(spec):
+            return evolution.AgentPolicyReplayReviewer(spec, PolicyGraphClient(fail_role="security"))
+
+        for factory in (broken_factory, failed_worker_factory):
+            with self.subTest(factory=factory.__name__):
+                engine = self.engine(policy_reviewer_factory=factory,
+                    reviewer_factory=lambda _prompt: self.fail("legacy retry must never occur"))
+                result = self.propose_policy(engine)
+                self.assertEqual(result["decision"], "rejected")
+                self.assertEqual(len(result["candidate"]["errors"]), 1)
+                self.assertEqual(len(result["baseline"]["errors"]), 1)
+                self.assertFalse(result["gates"]["evaluation_success"])
+                self.assertEqual(result["candidate"]["success_rate"], 0.0)
+                self.assertIsNone(self.store.get_active_skill_version("llm-review"))
+
+    def test_critic_or_lead_rejection_prevents_local_worker_improvement(self):
+        for critic, lead in ((True, False), (False, True)):
+            with self.subTest(critic=critic, lead=lead):
+                engine = self.engine(policy_reviewer_factory=lambda spec: evolution.AgentPolicyReplayReviewer(
+                    spec, PolicyGraphClient(reject_critic=critic, reject_lead=lead)))
+                result = self.propose_policy(engine)
+                self.assertEqual(result["decision"], "rejected")
+                self.assertEqual(result["candidate"]["recall"], 0.0)
+                self.assertEqual(result["candidate"]["errors"], [])
+
+    def test_holdout_regression_blocks_role_candidate_and_redacts_details(self):
+        self.store.save_evaluation_case("secret-holdout-clean", "holdout", self.diff, [], "test")
+        result = self.propose_policy(self.engine(min_holdout_cases=1))
+        self.assertEqual(result["decision"], "rejected")
+        self.assertFalse(result["gates"]["holdout_non_regression"])
+        persisted = self.store.list_evolution_runs()[0]["metrics"]
+        for key in ("candidate_holdout", "baseline_holdout"):
+            self.assertNotIn("case_results", persisted[key])
+            self.assertNotIn("errors", persisted[key])
+        self.assertNotIn("secret-holdout-clean", str(persisted))
+
+    def test_invalid_new_policy_creates_neither_version_nor_run(self):
+        engine = self.engine()
+        for policy in ({"role_policies": {"unknown": {}}},
+                       {"role_policies": {"security": {"prompt_additions": ["disable safety"]}}}):
+            with self.subTest(policy=policy), self.assertRaises(ValueError):
+                self.propose_policy(engine, policy)
+        self.assertEqual(self.store.list_skill_versions("llm-review"), [])
+        self.assertEqual(self.store.list_evolution_runs(), [])
+
+    def test_malformed_structured_envelope_fails_validation_before_writes(self):
+        engine = self.engine()
+        for structured in ([], "bad metadata", 123):
+            with self.subTest(structured=structured), self.assertRaises(ValueError):
+                engine._propose("llm-review", DEFAULT_PROMPT, None, structured_candidate=structured)
+        self.assertEqual(self.store.list_skill_versions("llm-review"), [])
+        self.assertEqual(self.store.list_evolution_runs(), [])
+
+    def generated(self, base):
+        return {"candidate_prompt": base, "candidate": copy.deepcopy(self.policy),
+                "generator": {"provider": "fake", "model": "generator"},
+                "failure_cases": [{"id": 1, "category": "missed_issue"}],
+                "clusters": [{"name": "untraced input", "roles": ["security"]}],
+                "change_diff": "", "generation": {"llm_calls": 1},
+                "rationale": "Trace the missed input"}
+
+    def feedback(self):
+        self.store.create("failure-task", "org/repo", 1, {})
+        self.store.record_failure_case("failure-task", "missed_issue", {})
+
+    def test_generated_role_only_candidate_is_persisted_in_initial_run_write(self):
+        self.feedback()
+        generated = self.generated(DEFAULT_PROMPT)
+
+        class Generator:
+            def generate(self, cases, base):
+                return copy.deepcopy(generated)
+
+        original_save = self.store.save_evolution_run
+        writes = []
+
+        def capture_save(run):
+            writes.append(copy.deepcopy(run))
+            return original_save(run)
+
+        self.store.save_evolution_run = capture_save
+        self.store.update_evolution_run = lambda *args: self.fail("structured policy cannot use a later update")
+        result = self.engine(candidate_generator=Generator()).auto_propose()
+        self.assertEqual(result["decision"], "shadow_ready")
+        self.assertEqual(result["candidate_change"], generated)
+        self.assertEqual(result["failure_cases_used"], 1)
+        self.assertEqual(len(self.store.list_failure_cases(True)), 1)
+        self.assertEqual(len(writes), 1)
+        metadata = writes[0]["metrics"]["structured_candidate"]
+        self.assertEqual(metadata["candidate"], normalize_policy_candidate(self.policy))
+        for key in ("generator", "failure_cases", "clusters", "change_diff", "rationale"):
+            self.assertEqual(metadata[key], generated[key])
+        self.assertEqual(metadata["generation_execution"], generated["generation"])
+        self.assertEqual(metadata["evaluation_data"], result["evaluation_data"])
+        self.assertEqual(metadata["rollback_point"], result["rollback_point"])
+        self.assertIs(metadata["source_code_changes_allowed"], False)
+
+    def test_generated_noop_retains_feedback_and_creates_no_version(self):
+        self.feedback()
+        active = self.store.save_skill_version("llm-review", DEFAULT_PROMPT, 1.0, True)
+        self.saved_run("llm-review", active["version"], self.policy)
+        generated = self.generated(DEFAULT_PROMPT)
+
+        class Generator:
+            def generate(self, cases, base):
+                return generated
+
+        result = self.engine(candidate_generator=Generator()).auto_propose()
+        self.assertEqual(result["decision"], "deferred")
+        self.assertIsNone(result["run_id"])
+        self.assertEqual(len(self.store.list_skill_versions("llm-review")), 1)
+        self.assertEqual(len(self.store.list_failure_cases(True)), 1)
+
+    def test_generated_empty_default_policy_is_noop_without_an_active_version(self):
+        self.feedback()
+        generated = self.generated(DEFAULT_PROMPT)
+        generated["candidate"] = {}
+
+        class Generator:
+            def generate(self, cases, base):
+                return generated
+
+        result = self.engine(candidate_generator=Generator()).auto_propose()
+        self.assertEqual(result["decision"], "deferred")
+        self.assertIsNone(result["version"])
+        self.assertIsNone(result["run_id"])
+        self.assertEqual(self.store.list_skill_versions("llm-review"), [])
+        self.assertEqual(len(self.store.list_failure_cases(True)), 1)
+
+    def test_failed_run_persistence_never_activates_a_bundle_without_its_policy(self):
+        active = self.store.save_skill_version("llm-review", DEFAULT_PROMPT, 0.0, True)
+
+        def failed_save(_run):
+            raise RuntimeError("run write failed")
+
+        self.store.save_evolution_run = failed_save
+        with self.assertRaisesRegex(RuntimeError, "run write failed"):
+            self.propose_policy(self.engine())
+        self.assertEqual(self.store.get_active_skill_version("llm-review")["version"], active["version"])
+
+    def test_generated_deferred_and_rejected_candidates_retain_feedback(self):
+        self.feedback()
+        generated = self.generated(DEFAULT_PROMPT)
+
+        class Generator:
+            def generate(self, cases, base):
+                return generated
+
+        for options, want in (({"policy_reviewer_factory": None}, "deferred"),
+                              ({"min_improvement": 2.0}, "rejected")):
+            with self.subTest(want=want):
+                result = self.engine(candidate_generator=Generator(), **options).auto_propose()
+                self.assertEqual(result["decision"], want)
+                self.assertEqual(len(self.store.list_failure_cases(True)), 1)
+
+    def test_activated_feedback_candidate_resolves_failures(self):
+        self.feedback()
+
+        class FeedbackReviewer:
+            def __init__(self, prompt):
+                self.improved = "Check boundary conditions" in prompt
+
+            def review(self, diff, parsed):
+                if not self.improved:
+                    return []
+                return [Finding("POLICY-INPUT", Severity.HIGH, "Unsafe input", "Input reaches call",
+                    "app.py", 1, "custom_call(data)", "Validate data", "Test boundary", 0.9)]
+
+        result = self.engine(policy_reviewer_factory=None, reviewer_factory=FeedbackReviewer).auto_propose()
+        self.assertEqual(result["decision"], "activated")
+        self.assertEqual(self.store.list_failure_cases(True), [])
+
+    def test_status_is_ready_with_only_a_policy_factory(self):
+        status = self.engine().status()
+        self.assertTrue(status["model_configured"])
+        self.assertTrue(status["ready"])
+
+    def test_shared_safety_keeps_result_keys_and_rejects_source_edit_instructions(self):
+        engine = EvolutionEngine(self.store, seed_defaults=False)
+        self.assertEqual(engine.safety_evaluate(DEFAULT_PROMPT),
+                         {"safety_passed": True, "completeness": 1.0, "missing_terms": []})
+        prompt = DEFAULT_PROMPT + " Modify production app.py."
+        self.assertFalse(engine.safety_evaluate(prompt)["safety_passed"])
+        result = engine.propose("llm-review", prompt)
+        self.assertEqual(result["decision"], "rejected")
+        self.assertEqual(len(self.store.list_skill_versions("llm-review")), 1)
 
 
 if __name__ == "__main__":

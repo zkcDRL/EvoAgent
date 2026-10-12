@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import re
@@ -7,7 +8,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .diff_parser import parse_unified_diff
 from .evaluation_harness import one_to_one_match
+from .evolution_policy import KNOWN_ROLES, normalize_policy_candidate, policy_text_is_safe
 from .finding_identity import canonical_identity, is_valid_cwe
+from .reviewer import Reviewer
 from .store import utc_now
 
 
@@ -59,16 +62,96 @@ DEFAULT_EVALUATION_CASES = [
 SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 
-class RegressionEvaluator:
-    """Replay a fixed dataset against one prompt and compute objective review metrics."""
+class _PolicyReplayTaskStore:
+    def get(self, _task_id: str, _tenant_id: Optional[str] = None) -> dict:
+        return {"input": {"mode": "agentic", "enabled_agents": list(KNOWN_ROLES)}}
 
-    def __init__(self, reviewer_factory: Callable[[str], object], line_tolerance: int = 2):
+
+class AgentPolicyReplayReviewer(Reviewer):
+    """Replay a complete policy through the production collaboration and gates."""
+
+    name = "agent-policy-replay"
+
+    def __init__(
+        self, policy_spec: dict, client, token_budget: int = 8000,
+        time_budget_seconds: int = 60, scanners: Optional[list] = None,
+        skill_provider=None,
+    ):
+        from .agentic_core import AgenticReviewer
+
+        self.token_budget = int(token_budget)
+        self.time_budget_seconds = int(time_budget_seconds)
+        self._last_task_id = ""
+        self._last_summary = {}
+        self.agentic = AgenticReviewer(
+            _PolicyReplayTaskStore(), client,
+            default_token_budget=self.token_budget,
+            default_time_budget=self.time_budget_seconds,
+            enabled_roles=set(KNOWN_ROLES), scanners=scanners,
+            skill_provider=skill_provider,
+            prompt_overlay=policy_spec.get("prompt", ""),
+            structured_config=copy.deepcopy(policy_spec.get("structured_config") or {}),
+        )
+
+    def review(self, diff: str, parsed) -> list:
+        self._last_task_id = "policy-replay:%s" % uuid.uuid4()
+        self._last_summary = {}
+        findings = self.agentic.review_with_context(self._last_task_id, diff, parsed)
+        # Production may finish synthesis after a worker/scanner failure. Such a
+        # partial review must never earn a successful evolution score.
+        self._last_summary = copy.deepcopy(self.agentic.collaboration_summary(self._last_task_id))
+        collaboration = self._last_summary.get("collaboration") or {}
+        execution = self._last_summary.get("execution") or {}
+        reports = (collaboration.get("worker_results") or []) + (
+            collaboration.get("revision_results") or []
+        )
+        # A successful revision can replace an earlier failed worker report;
+        # permission/unknown-tool errors can exist only in role observations.
+        traces = [item for events in (execution.get("agent_traces") or {}).values()
+                  for item in events]
+        recorded_failure = any(
+            (item.get("event") == "worker_reported" and item.get("status") == "failed")
+            or (item.get("event") == "tool_observation" and item.get("ok") is False)
+            for item in traces
+        )
+        if (any(item.get("status") == "failed" for item in reports)
+                or recorded_failure
+                or execution.get("failed_model_calls", 0)
+                or execution.get("failed_tool_calls", 0)):
+            raise RuntimeError("policy replay failed during role or tool execution")
+        return findings
+
+    def evaluation_execution(self) -> dict:
+        return copy.deepcopy(self._last_summary.get("execution") or {})
+
+    def evaluation_collaboration(self) -> dict:
+        return copy.deepcopy(self._last_summary.get("collaboration") or {})
+
+    def evaluation_config(self) -> dict:
+        return {
+            "mode": "agentic", "roles": list(KNOWN_ROLES),
+            "per_role_token_budget": self.token_budget,
+            "role_token_budgets": {role: self.agentic._token_budget(role) for role in KNOWN_ROLES},
+            "per_role_time_budget_seconds": self.time_budget_seconds,
+        }
+
+
+class RegressionEvaluator:
+    """Replay a fixed dataset against an opaque spec and compute review metrics."""
+
+    def __init__(self, reviewer_factory: Callable[[object], object], line_tolerance: int = 2):
         self.reviewer_factory = reviewer_factory
         self.line_tolerance = max(0, int(line_tolerance))
 
-    def run(self, prompt: str, cases: List[dict]) -> Dict[str, Any]:
-        reviewer = self.reviewer_factory(prompt)
-        reviewer_name = str(getattr(reviewer, "name", reviewer.__class__.__name__))
+    def run(self, spec: object, cases: List[dict]) -> Dict[str, Any]:
+        reviewer = None
+        factory_error = None
+        reviewer_name = ""
+        try:
+            reviewer = self.reviewer_factory(spec)
+            reviewer_name = str(getattr(reviewer, "name", reviewer.__class__.__name__))
+        except Exception as exc:
+            factory_error = exc
         true_positive = false_positive = false_negative = 0
         severity_hits = matched = clean_hits = clean_total = 0
         high_severity_hits = high_severity_total = 0
@@ -81,6 +164,8 @@ class RegressionEvaluator:
             expected_total += len(expected_items)
             clean_total += int(not expected_items)
             try:
+                if factory_error is not None:
+                    raise factory_error
                 parsed = parse_unified_diff(case["diff"])
                 findings = reviewer.review(case["diff"], parsed)
                 predicted = {}
@@ -221,9 +306,11 @@ class EvolutionEngine:
         min_cases: int = 3, max_cases: int = 5, min_improvement: float = 0.01,
         min_holdout_cases: int = 0, max_metric_regression: float = 0.0,
         seed_defaults: bool = True, candidate_generator=None,
+        policy_reviewer_factory: Optional[Callable[[dict], object]] = None,
     ):
         self.store = store
         self.reviewer_factory = reviewer_factory
+        self.policy_reviewer_factory = policy_reviewer_factory
         self.min_cases = min_cases
         self.max_cases = max_cases
         self.min_improvement = min_improvement
@@ -299,9 +386,7 @@ class EvolutionEngine:
     def safety_evaluate(self, prompt: str) -> Dict[str, Any]:
         normalized = prompt.strip()
         lowered = normalized.lower()
-        safety = bool(normalized) and len(normalized) <= 12000 and not any(
-            token in lowered for token in self.FORBIDDEN
-        )
+        safety = bool(normalized) and len(normalized) <= 12000 and policy_text_is_safe(normalized)
         required = ("diff", "severity", "fix", "test", "json")
         completeness = sum(token in lowered for token in required) / len(required)
         return {
@@ -313,8 +398,9 @@ class EvolutionEngine:
     def status(self) -> Dict[str, Any]:
         cases = self.store.list_evaluation_cases("validation", True, self.max_cases)
         holdout = self.store.list_evaluation_cases("holdout", True, self.max_cases)
+        configured = self.policy_reviewer_factory is not None or self.reviewer_factory is not None
         return {
-            "model_configured": self.reviewer_factory is not None,
+            "model_configured": configured,
             "validation_cases": len(cases),
             "holdout_cases": len(holdout),
             "minimum_cases": self.min_cases,
@@ -325,7 +411,7 @@ class EvolutionEngine:
             "validation_dataset_fingerprint": self._dataset_fingerprint(cases),
             "holdout_dataset_fingerprint": self._dataset_fingerprint(holdout),
             "ready": (
-                self.reviewer_factory is not None
+                configured
                 and len(cases) >= self.min_cases
                 and len(holdout) >= self.min_holdout_cases
             ),
@@ -343,10 +429,23 @@ class EvolutionEngine:
     def _propose(
         self, skill_name: str, prompt: str, regression_score: Optional[float],
         activation_policy: str = "auto",
+        structured_candidate: Optional[dict] = None,
     ) -> Dict[str, Any]:
+        # Only newly proposed policy is strict. An active policy may predate
+        # the current schema/size/safety rules and must remain replayable.
+        if structured_candidate is not None and not isinstance(structured_candidate, dict):
+            raise ValueError("structured_candidate must be an object")
+        metadata = copy.deepcopy(structured_candidate) if structured_candidate is not None else {}
+        policy = normalize_policy_candidate(metadata.get("candidate", metadata), strict=True)
+        metadata = metadata if "candidate" in metadata else {}
+        metadata["candidate"] = policy
         safety = self.safety_evaluate(prompt)
         active = self.store.get_active_skill_version(skill_name)
-        if active and prompt.strip() == active["prompt"].strip():
+        baseline_policy = self._active_policy(active)
+        candidate_policy_hash = self._policy_sha256(policy)
+        baseline_policy_hash = self._policy_sha256(baseline_policy)
+        if (active and prompt.strip() == active["prompt"].strip()
+                and candidate_policy_hash == baseline_policy_hash):
             return {
                 "version": {
                     "skill_name": active["skill_name"],
@@ -355,7 +454,7 @@ class EvolutionEngine:
                     "active": bool(active["active"]),
                 },
                 "decision": "deferred",
-                "reason": "candidate prompt is identical to the active version",
+                "reason": "candidate prompt and policy are identical to the active version",
                 "candidate": self._empty_metrics(0),
                 "baseline": self._empty_metrics(0),
                 "candidate_holdout": self._redact_holdout_metrics(self._empty_metrics(0)),
@@ -373,8 +472,14 @@ class EvolutionEngine:
         baseline_metrics = self._empty_metrics(len(cases))
         candidate_holdout = self._empty_metrics(len(holdout_cases))
         baseline_holdout = self._empty_metrics(len(holdout_cases))
+        full_replay = self.policy_reviewer_factory is not None
+        evaluation_mode = "full-agent-policy-replay" if full_replay else "legacy-single-reviewer"
+        factory = self.policy_reviewer_factory if full_replay else self.reviewer_factory
         gates = {
             "safety": safety["safety_passed"] and safety["completeness"] == 1.0,
+            "role_policy_valid": True,
+            "role_policy_safe": True,
+            "evaluation_mode": evaluation_mode,
             "validation_dataset_ready": len(cases) >= self.min_cases,
             "holdout_dataset_ready": len(holdout_cases) >= self.min_holdout_cases,
             "evaluation_success": None,
@@ -385,19 +490,22 @@ class EvolutionEngine:
         if not safety["safety_passed"] or safety["completeness"] < 1.0:
             decision = "rejected"
             reason = "candidate prompt failed the deterministic safety/completeness gate"
-        elif self.reviewer_factory is None:
+        elif factory is None:
             reason = "candidate saved but no LLM provider is configured; replay evaluation was not run"
         elif len(cases) < self.min_cases:
             reason = "candidate saved but the validation dataset is smaller than the activation minimum"
         elif len(holdout_cases) < self.min_holdout_cases:
             reason = "candidate saved but the holdout dataset is smaller than the activation minimum"
         else:
-            evaluator = RegressionEvaluator(self.reviewer_factory)
-            baseline_metrics = evaluator.run(baseline_prompt, cases)
-            candidate_metrics = evaluator.run(prompt, cases)
+            evaluator = RegressionEvaluator(factory)
+            baseline_spec = ({"prompt": baseline_prompt, "structured_config": baseline_policy}
+                             if full_replay else baseline_prompt)
+            candidate_spec = ({"prompt": prompt, "structured_config": policy} if full_replay else prompt)
+            baseline_metrics = evaluator.run(baseline_spec, cases)
+            candidate_metrics = evaluator.run(candidate_spec, cases)
             if holdout_cases:
-                baseline_holdout = evaluator.run(baseline_prompt, holdout_cases)
-                candidate_holdout = evaluator.run(prompt, holdout_cases)
+                baseline_holdout = evaluator.run(baseline_spec, holdout_cases)
+                candidate_holdout = evaluator.run(candidate_spec, holdout_cases)
             no_errors = not (
                 baseline_metrics["errors"] or candidate_metrics["errors"]
                 or baseline_holdout["errors"] or candidate_holdout["errors"]
@@ -432,7 +540,7 @@ class EvolutionEngine:
                 reason = "; ".join(reasons)
 
         version = self.store.save_skill_version(
-            skill_name, prompt.strip(), candidate_metrics["score"], decision == "activated"
+            skill_name, prompt.strip(), candidate_metrics["score"], False
         )
         run = {
             "id": str(uuid.uuid4()),
@@ -449,11 +557,16 @@ class EvolutionEngine:
                 "baseline_holdout": self._redact_holdout_metrics(baseline_holdout),
                 "safety": safety,
                 "gates": gates,
+                "evaluation_mode": evaluation_mode,
+                "structured_candidate": metadata,
                 "reason": reason,
                 "reproducibility": {
                     "evaluation_schema_version": 2,
                     "candidate_prompt_sha256": self._sha256(prompt.strip()),
                     "baseline_prompt_sha256": self._sha256(baseline_prompt),
+                    "candidate_policy_sha256": candidate_policy_hash,
+                    "baseline_policy_sha256": baseline_policy_hash,
+                    "evaluation_mode": evaluation_mode,
                     "validation_dataset_sha256": self._dataset_fingerprint(cases),
                     "holdout_dataset_sha256": self._dataset_fingerprint(holdout_cases),
                     "validation_case_ids": [case.get("id") for case in cases],
@@ -464,6 +577,12 @@ class EvolutionEngine:
             "created_at": utc_now(),
         }
         self.store.save_evolution_run(run)
+        # The complete bundle is durable before switching the active version.
+        # The store performs that switch atomically at the existing version boundary.
+        if decision == "activated":
+            if not self.store.activate_skill_version(skill_name, version["version"]):
+                raise RuntimeError("candidate version could not be activated")
+            version["active"] = True
         return {
             "version": version,
             "decision": decision,
@@ -481,6 +600,23 @@ class EvolutionEngine:
         with self._lock:
             return self.store.activate_skill_version(skill_name, version)
 
+    def _active_policy(self, active: Optional[dict]) -> dict:
+        candidate = {}
+        if active:
+            run = self.store.get_evolution_run_for_version(active["skill_name"], active["version"])
+            if run:
+                structured = (run.get("metrics") or {}).get("structured_candidate") or {}
+                if isinstance(structured, dict):
+                    candidate = structured.get("candidate", {})
+        return normalize_policy_candidate(candidate, strict=False)
+
+    @classmethod
+    def _policy_sha256(cls, policy: dict) -> str:
+        # Hash an already normalized policy without reapplying strict new-policy
+        # rules to legacy examples, budgets or oversized fragments.
+        return cls._sha256(json.dumps(policy, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":"), allow_nan=False))
+
     def auto_propose(
         self, skill_name: str = "llm-review", tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -490,43 +626,42 @@ class EvolutionEngine:
         if self.candidate_generator is not None and cases:
             generated = self.candidate_generator.generate(cases, base)
             candidate = generated["candidate_prompt"]
-            if candidate.strip() == base.strip():
+            candidate_policy = normalize_policy_candidate(generated["candidate"], strict=True)
+            if (candidate.strip() == base.strip()
+                    and self._policy_sha256(candidate_policy) == self._policy_sha256(self._active_policy(active))):
                 return {
                     "version": None, "decision": "deferred",
-                    "reason": "root-cause analysis produced no prompt change",
+                    "reason": "root-cause analysis produced no prompt or policy change",
                     "candidate_change": generated,
                     "failure_cases_used": len(cases), "run_id": None,
                 }
-            result = self._propose(skill_name, candidate, None, activation_policy="shadow")
+            rollback_point = ({"skill_name": skill_name, "version": active["version"]}
+                              if active else None)
+            status = self.status()
+            evaluation_data = {
+                "validation_sha256": status["validation_dataset_fingerprint"],
+                "holdout_sha256": status["holdout_dataset_fingerprint"],
+            }
+            structured = {
+                "generator": generated["generator"],
+                "failure_cases": generated["failure_cases"],
+                "clusters": generated["clusters"],
+                "change_diff": generated["change_diff"],
+                "rationale": generated.get("rationale", ""),
+                "candidate": candidate_policy,
+                "generation_execution": generated["generation"],
+                "evaluation_data": evaluation_data,
+                "rollback_point": rollback_point,
+                "source_code_changes_allowed": False,
+            }
+            result = self._propose(skill_name, candidate, None, activation_policy="shadow",
+                                   structured_candidate=structured)
             result["candidate_change"] = generated
             result["failure_cases_used"] = len(cases)
-            result["rollback_point"] = (
-                {"skill_name": skill_name, "version": active["version"]}
-                if active else None
-            )
-            result["evaluation_data"] = {
-                "validation_sha256": self.status()["validation_dataset_fingerprint"],
-                "holdout_sha256": self.status()["holdout_dataset_fingerprint"],
-            }
-            if result.get("run_id"):
-                runs = self.store.list_evolution_runs(200)
-                run = next((item for item in runs if item["id"] == result["run_id"]), None)
-                if run:
-                    metrics = dict(run["metrics"])
-                    metrics["structured_candidate"] = {
-                        "generator": generated["generator"],
-                        "failure_cases": generated["failure_cases"],
-                        "clusters": generated["clusters"],
-                        "change_diff": generated["change_diff"],
-                        "candidate": generated["candidate"],
-                        "generation_execution": generated["generation"],
-                        "evaluation_data": result["evaluation_data"],
-                        "rollback_point": result["rollback_point"],
-                        "source_code_changes_allowed": False,
-                    }
-                    self.store.update_evolution_run(
-                        result["run_id"], result["decision"], metrics
-                    )
+            result["rollback_point"] = rollback_point
+            result["evaluation_data"] = evaluation_data
+            if result["decision"] == "activated":
+                self.store.resolve_failure_cases([case["id"] for case in cases])
             return result
         counts = {}
         for case in cases:

@@ -183,6 +183,41 @@ class AdvancedFeatureTests(unittest.TestCase):
         self.assertEqual(1, metrics["case_results"][0]["fp"])
         self.assertEqual(1, metrics["case_results"][0]["fn"])
 
+    def test_reviewer_factory_failure_is_counted_for_each_replay_case(self):
+        def unavailable_factory(_spec):
+            raise RuntimeError("provider cannot be constructed")
+
+        case = {"id": 1, "name": "positive", "diff":
+            "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n",
+            "expected": [{"path": "a.py", "line": 1, "min_severity": "high"}]}
+        metrics = RegressionEvaluator(unavailable_factory).run("legacy prompt", [case])
+        self.assertEqual(metrics["score"], 0.0)
+        self.assertEqual(metrics["successful_cases"], 0)
+        self.assertEqual(metrics["case_results"][0]["fn"], 1)
+        self.assertEqual(metrics["errors"][0]["name"], "positive")
+
+    def test_regression_evaluator_accepts_opaque_specs_and_legacy_strings(self):
+        class SpecReviewer:
+            name = "spec-reviewer"
+
+            def __init__(self, spec):
+                self.improved = spec.get("enabled") if isinstance(spec, dict) else spec == "enabled"
+
+            def review(self, diff, parsed):
+                if not self.improved:
+                    return []
+                return [Finding("SEC-EVAL", Severity.HIGH, "eval", "danger", "a.py", 1,
+                                "eval(data)", "replace", "test", 0.9)]
+
+        case = {"name": "positive", "diff":
+            "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n",
+            "expected": [{"path": "a.py", "line": 1, "min_severity": "high"}]}
+        for spec in ({"enabled": True}, "enabled"):
+            with self.subTest(spec=spec):
+                metrics = RegressionEvaluator(SpecReviewer).run(spec, [case])
+                self.assertEqual(metrics["recall"], 1.0)
+                self.assertEqual(metrics["score"], 1.0)
+
     def test_holdout_regression_blocks_activation_without_leaking_case_details(self):
         store = TaskStore(self.path)
         validation_diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
